@@ -32,7 +32,10 @@ exact `tshark` command it runs**, so it doubles as a way to learn the queries.
 - **Cracking hand-off** — list PMKIDs and export a `hashcat -m 22000` file.
 - **Profiling** — probe-request mapping (what SSIDs each client is hunting for) and a per-client
   handshake-completeness / crackability table.
-- **Reports** — dump everything to a clean Markdown file.
+- **Network map** — auto-generate a `.drawio` diagram for the SSID: physical AP units
+  (clustered from the backhaul topology), clients grouped under the AP they joined, wired hosts,
+  and the WAN/gateway — each labeled with IP / MAC / hostname / OS / protocols.
+- **Reports** — dump everything to a clean Markdown file (plus the matching map).
 - **UX** — color + emoji + clickable (OSC-8) MAC→vendor links and role-colored addresses, all of
   which **auto-disable** when piped, redirected, or `NO_COLOR` is set (reports stay plain).
 
@@ -95,7 +98,8 @@ chmod +x wifiscope.sh
 | `scrapegtk` | Sweep the whole capture for GTKs → keyring |
 | `addkey` / `import` | Add external key material to the keyring |
 | `keyring` / `delkey` / `clearkey` | Manage the keyring |
-| `report` | Everything → Markdown |
+| `map` | draw.io network diagram (AP units, clients, wired hosts, WAN) |
+| `report` | Everything → Markdown **and** a matching `.drawio` map |
 
 ### Environment
 

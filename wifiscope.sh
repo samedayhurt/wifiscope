@@ -27,6 +27,14 @@ set -uo pipefail
 # Override the tshark path if it isn't on $PATH:  TSHARK=/opt/wireshark/bin/tshark ./wifiscope.sh
 TSHARK="${TSHARK:-tshark}"
 
+# Pick a WORKING python: prefer python3, but fall back to `python` when python3 is
+# the Windows Store stub (it only prints an install message and exits non-zero).
+# Used by key derivation (harvest) and the draw.io map generator.
+PYBIN="$(command -v python3 2>/dev/null || true)"
+if [ -z "$PYBIN" ] || ! "$PYBIN" -c 'pass' >/dev/null 2>&1; then
+  PYBIN="$(command -v python 2>/dev/null || true)"
+fi
+
 PCAP=""              # capture file we're working on
 SSID=""             # the target network name (once selected)
 PASS=""             # WPA passphrase (optional, for decryption)
@@ -252,7 +260,7 @@ rebuild_dec() {
 #   PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096 iters, 32 bytes). Deterministic,
 #   so this IS the network's PSK in raw hex — usable as a wpa-psk key.
 pmk_hex() {
-  python3 - "$PASS" "$SSID" <<'PY'
+  "$PYBIN" - "$PASS" "$SSID" <<'PY'
 import sys, hashlib, binascii
 print(binascii.hexlify(hashlib.pbkdf2_hmac('sha1', sys.argv[1].encode(),
       sys.argv[2].encode(), 4096, 32)).decode())
@@ -313,7 +321,7 @@ PY
   local out
   out="$(ts -Y "wlan_rsna_eapol.keydes.msgnr in {1,2,3} && $(bssid_filter)" -T fields \
         -e wlan.sa -e wlan.da -e wlan_rsna_eapol.keydes.msgnr -e wlan_rsna_eapol.keydes.nonce \
-        | python3 -c "$PTK_PY" "$pmk")"
+        | "$PYBIN" -c "$PTK_PY" "$pmk")"
   [ -n "$out" ] || { note "no complete handshakes (need both nonces) to derive PTKs"; return; }
   local sta ap tk
   while IFS=$'\t' read -r sta ap tk; do
@@ -617,7 +625,7 @@ export22000() {
     return
   fi
   note "hcxpcapngtool not installed — exporting PMKID (WPA*01) lines only"
-  local ehex; ehex="$(python3 -c 'import sys;print(sys.argv[1].encode().hex())' "$SSID")"
+  local ehex; ehex="$("$PYBIN" -c 'import sys;print(sys.argv[1].encode().hex())' "$SSID")"
   ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
      -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid \
     | awk -F'\t' -v e="$ehex" '$3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
@@ -664,6 +672,175 @@ delkey() {
 # clearkey: wipe the whole keyring.
 clearkey() { [ -n "$KEYRING" ] && : > "$KEYRING"; rebuild_dec; ok "keyring cleared"; }
 
+# map: draw a draw.io network diagram of the selected SSID -> <ssid>.drawio.
+#   Physical AP units (clustered best-effort: TP-Link/most vendors keep a BSSID's
+#   last 4 octets across its virtual BSSIDs, so we key on octets 3-6 with the last
+#   octet's low 2 bits masked), wireless clients grouped under the AP they joined,
+#   wired hosts, and the WAN/gateway. Full host labels (IP/host/OS/proto) need the
+#   keyring; without keys it still draws the L2 layer (APs + associations + backhaul).
+map() {
+  [ -n "$SSID" ] || { note "select an SSID first (s)"; return; }
+  local out="${1:-${SSID}.drawio}" wd; wd="$(mktemp -d)"
+  section "🗺️  drawing network map for $SSID"
+  # --- collect data into TSV files the generator reads ---
+  ts  -Y "$(beacons_of_target)" -T fields -e wlan.bssid -e wlan.ds.current_channel \
+      -e wlan.ht.info.primarychannel -e radiotap.channel.freq 2>/dev/null | sort -u > "$wd/beacons.tsv"
+  ts  -Y "wps.model_name && $(bssid_filter)" -T fields -e wps.manufacturer -e wps.model_name 2>/dev/null \
+      | sort -u | head -1 > "$wd/wps.tsv"
+  ts  -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da -e wlan.bssid 2>/dev/null \
+      | awk -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
+          {sa=tolower($1); sta=(sa in AP)?$2:$1; if(sta!="")print sta"\t"$3}' | sort -u > "$wd/clients.tsv"
+  ts  -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u > "$wd/backhaul.tsv"
+  tsd -Y 'dhcp' -T fields -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
+      -e dhcp.option.hostname -e dhcp.option.vendor_class_id 2>/dev/null | sort -u > "$wd/dhcp.tsv"
+  tsd -Y 'dhcp.option.router' -T fields -e dhcp.option.router 2>/dev/null | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
+  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac 2>/dev/null | sort -u > "$wd/arp.tsv"
+  tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name 2>/dev/null | sort -u > "$wd/names.tsv"
+  tsd -Y 'ip' -T fields -e ip.src -e _ws.col.protocol 2>/dev/null | sort -u > "$wd/proto.tsv"
+  printf '%s' "$SSID" > "$wd/ssid.txt"
+  # --- generate the .drawio (python; script in a var so stdin stays free) ---
+  local GEN_PY; read -r -d '' GEN_PY <<'PY'
+import sys, os
+from collections import defaultdict
+wd, out = sys.argv[1], sys.argv[2]
+def rd(f):
+    p=os.path.join(wd,f); R=[]
+    if os.path.exists(p):
+        for ln in open(p,encoding='utf-8',errors='replace'):
+            ln=ln.rstrip('\r\n')
+            if ln.strip(): R.append(ln.split('\t'))
+    return R
+def one(f):
+    R=rd(f); return R[0] if R else []
+def txt(f):
+    p=os.path.join(wd,f); return open(p,encoding='utf-8').read().strip() if os.path.exists(p) else ''
+def esc(s): return (s or '').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;').replace('"','&quot;')
+def ukey(b):
+    o=b.lower().split(':')
+    return b.lower() if len(o)!=6 else ':'.join(o[2:5])+':%02x'%(int(o[5],16)&0xFC)
+ssid=txt('ssid.txt'); gwip=txt('gw.txt')
+band={}; chan={}
+for r in rd('beacons.tsv'):
+    b=r[0].lower(); f=0
+    try: f=int(r[3])
+    except: pass
+    band[b]='5G' if f>5000 else '2.4G'
+    chan[b]=(r[2] if f>5000 else r[1]) if len(r)>2 else ''
+mk=' '.join(x for x in one('wps.tsv') if x).strip() or 'AP'
+dhcp={}
+for r in rd('dhcp.tsv'):
+    # tshark joins repeated field occurrences with commas (e.g. the mac appears
+    # twice) — take the first value of each so the mac key matches cleanly.
+    mac=(r[0].split(',')[0] if r else '').lower()
+    if not mac: continue
+    d=dhcp.setdefault(mac,{'ip':'','host':'','vc':''})
+    ipv=r[2] if len(r)>2 and r[2] and r[2]!='0.0.0.0' else (r[1] if len(r)>1 and r[1] and r[1]!='0.0.0.0' else '')
+    ipv=ipv.split(',')[0]
+    if ipv: d['ip']=ipv
+    if len(r)>3 and r[3]: d['host']=r[3].split(',')[0]
+    if len(r)>4 and r[4]: d['vc']=r[4].split(',')[0]
+mac2ip={}; ip2mac={}
+for r in rd('arp.tsv'):
+    if len(r)>=2 and r[0] and r[1]: ip2mac[r[0]]=r[1].lower(); mac2ip[r[1].lower()]=r[0]
+ipname={}
+for r in rd('names.tsv'):
+    if not r: continue
+    ip=r[0]
+    nb=(r[1] if len(r)>1 else '').split(',')[0].split('<')[0].strip()   # NBNS: drop <00> suffix + dup
+    md=''
+    if len(r)>2 and r[2]:
+        for t in r[2].split(','):                                       # mDNS: prefer a real host.local
+            t=t.strip()
+            if t.endswith('.local') and '_' not in t: md=t[:-6]; break
+    nm=nb or md
+    if ip and nm and ip not in ipname: ipname[ip]=nm
+proto=defaultdict(set)
+for r in rd('proto.tsv'):
+    if len(r)>=2: proto[r[0]].add(r[1])
+cli=defaultdict(set)
+for r in rd('clients.tsv'):
+    if len(r)>=2: cli[r[0].lower()].add(r[1].lower())
+apb=set(band)
+units=defaultdict(set)
+for b in apb: units[ukey(b)].add(b)
+gwmac=ip2mac.get(gwip,'')
+rootk=ukey(gwmac) if gwmac else None
+if rootk not in units and gwmac:
+    g4=gwmac.split(':')[2:]
+    for k in units:
+        if any(x.split(':')[2:]== g4 or x.split(':')[3:]==gwmac.split(':')[3:] for x in units[k]): rootk=k; break
+if rootk not in units:
+    rootk=max(units,key=lambda k:sum(1 for s in cli for b in cli[s] if b in units[k])) if units else None
+def enrich(mac):
+    mac=mac.lower(); d=dhcp.get(mac,{})
+    ip=d.get('ip') or mac2ip.get(mac,'')
+    host=d.get('host') or ipname.get(ip,'')
+    return ip, host, d.get('vc',''), sorted(proto.get(ip,[]))[:6]
+cl_unit={}
+for sta,bs in cli.items():
+    k=next((ukey(b) for b in bs if b in apb), ukey(sorted(bs)[0]))
+    cl_unit[sta]=(k, sorted(bs)[0])
+known=set(apb)|set(cli)|{b for k in units for b in units[k]}
+# wired = decrypted L2 devices that aren't clients or APs — but NOT the gateway
+# (its MAC/IP is the router itself, drawn as the WAN uplink, not a host).
+wired=[m for m,ip in mac2ip.items() if m not in known and m!=gwmac and ip!=gwip]
+cells=[]; nid=[1]
+def cell(label,x,y,w,h,style):
+    i='n%d'%nid[0]; nid[0]+=1
+    v=esc(label).replace(chr(10),'&#10;')
+    cells.append('<mxCell id="%s" value="%s" style="%s" vertex="1" parent="1"><mxGeometry x="%d" y="%d" width="%d" height="%d" as="geometry"/></mxCell>'%(i,v,style,x,y,w,h))
+    return i
+def edge(s,t,label,style):
+    i='e%d'%nid[0]; nid[0]+=1
+    cells.append('<mxCell id="%s" value="%s" style="%s" edge="1" parent="1" source="%s" target="%s"><mxGeometry relative="1" as="geometry"/></mxCell>'%(i,esc(label),style,s,t))
+AP_R='rounded=1;fillColor=#dae8fc;strokeColor=#6c8ebf;whiteSpace=wrap;html=1;fontSize=11;'
+AP_S='rounded=1;fillColor=#d5e8d4;strokeColor=#82b366;whiteSpace=wrap;html=1;fontSize=11;'
+CLI ='rounded=1;fillColor=#e1d5e7;strokeColor=#9673a6;whiteSpace=wrap;html=1;fontSize=10;'
+WIR ='rounded=1;fillColor=#ffe6cc;strokeColor=#d79b00;whiteSpace=wrap;html=1;fontSize=10;'
+WAN ='ellipse;shape=cloud;fillColor=#f5f5f5;strokeColor=#666666;whiteSpace=wrap;html=1;'
+EBH ='endArrow=none;dashed=1;strokeColor=#b85450;strokeWidth=2;html=1;fontSize=9;'
+ECL ='endArrow=none;strokeColor=#9673a6;html=1;fontSize=9;'
+EWI ='endArrow=none;strokeColor=#d79b00;strokeWidth=2;html=1;fontSize=9;'
+EWA ='endArrow=none;strokeColor=#666666;strokeWidth=2;html=1;'
+ordered=([rootk]+[k for k in units if k!=rootk]) if rootk in units else list(units)
+uid={}; ux={}; x=80
+for k in ordered:
+    if k is None: continue
+    bs=sorted(units[k])
+    head=('ROOT / GATEWAY' if k==rootk else 'satellite')
+    radios='  '.join('%s %s ch%s'%(':'.join(b.split(':')[3:]),band.get(b,'?'),chan.get(b,'?')) for b in bs[:2])
+    uid[k]=cell('%s\n%s\n%s'%(head,mk,radios), x,200,250,90, AP_R if k==rootk else AP_S); ux[k]=x; x+=290
+if rootk in ux and gwip:
+    w=cell('Internet / ISP\n(uplink %s)'%gwip, ux[rootk]+45,40,160,70, WAN); edge(w,uid[rootk],'',EWA)
+for k in ordered:
+    if k in uid and rootk in uid and k!=rootk: edge(uid[rootk],uid[k],'WDS backhaul',EBH)
+percol=defaultdict(int)
+for sta,(k,b) in sorted(cl_unit.items()):
+    if k not in ux: continue
+    c=percol[k]; percol[k]+=1
+    ip,host,vc,pr=enrich(sta)
+    lbl='\n'.join(x for x in [host or '(client)', ip, sta, vc, ' '.join(pr)] if x)
+    ci=cell(lbl, ux[k], 350+c*100, 230, 86, CLI)
+    edge(uid[k],ci,'%s ch%s'%(band.get(b,''),chan.get(b,'')),ECL)
+wx=80
+for m in sorted(wired):
+    ip,host,vc,pr=enrich(m)
+    if not ip: continue
+    lbl='\n'.join(x for x in [host or '(wired host)', ip, m, ' '.join(pr)] if x)
+    wi=cell(lbl, wx, 650, 230, 86, WIR)
+    if rootk in uid: edge(uid[rootk],wi,'wired',EWI)
+    wx+=250
+cell('%s — network map  (AP units clustered best-effort)'%ssid, 80,150,520,24,'text;html=1;fontStyle=1;fontSize=13;')
+xml='<mxfile><diagram name="%s"><mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" page="1" pageWidth="1600" pageHeight="1100"><root><mxCell id="0"/><mxCell id="1" parent="0"/>%s</root></mxGraphModel></diagram></mxfile>'%(esc(ssid or 'net'),''.join(cells))
+open(out,'w',encoding='utf-8').write(xml)
+print('units=%d clients=%d wired=%d'%(len([k for k in units if k]),len(cl_unit),sum(1 for m in wired if mac2ip.get(m))))
+PY
+  local summary; summary="$("$PYBIN" -c "$GEN_PY" "$wd" "$out" 2>&1)"
+  rm -rf "$wd"
+  if [ -s "$out" ]; then ok "wrote $(hlink "file://$PWD/$out" "$out") ($summary) — open at app.diagrams.net"
+  else note "map generation produced nothing"; fi
+}
+
 # report: run every section into a markdown file. tshark's teaching lines go to
 #         stderr, so 2>/dev/null keeps the report clean (data only).
 report() {
@@ -683,6 +860,8 @@ report() {
     done
   } > "$out" 2>/dev/null
   ok "wrote $out"
+  # also emit the matching draw.io network map next to the report
+  map "${out%.md}.drawio" >/dev/null
 }
 
 # =============================================================================
@@ -707,7 +886,7 @@ menu() {
    ${C_CYN}CRACK${C_RESET}    p pmkid   x export22000  ${C_DIM}(hashcat -m 22000)${C_RESET}
    ${C_CYN}KEYS${C_RESET}     k passphrase  h harvest  g scrapegtk
             a addkey  i import  K show  d delkey  c clearkey
-   ${C_CYN}SESSION${C_RESET}  s select-ssid  r report  q quit
+   ${C_CYN}SESSION${C_RESET}  s select-ssid  m map  r report  q quit
   ${C_DIM}──────────────────────────────────────────────────────────${C_RESET}
 EOF
     # `|| break` exits cleanly on end-of-input instead of spinning on empty reads.
@@ -734,6 +913,7 @@ EOF
       K|keyring)    keyring ;;
       d|delkey)     delkey ;;
       c|clearkey)   clearkey ;;
+      m|map)        printf 'drawio file [%s.drawio]: ' "${SSID:-net}"; read -e -r f; map "${f:-}" ;;
       r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; report "${f:-}" ;;
       q|quit)       break ;;
       *)            note "unknown choice: $c" ;;
@@ -759,7 +939,7 @@ main() {
 
   # One-shot form:  wifiscope.sh <command> <pcap> [ssid] [passphrase]
   case "${1:-}" in
-    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keyring|pmkid|probes|handshakes|export22000)
+    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keyring|pmkid|probes|handshakes|export22000|map)
       local cmd="$1"; shift
       [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
       load_pcap "$1"
