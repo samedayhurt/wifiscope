@@ -1,0 +1,17 @@
+# captures & anything derived from a real network — never commit
+*.pcap
+*.pcapng
+*.cap
+*.keys
+*.hc22000
+*.22000
+
+# generated reports / lab writeups (may contain real MACs, keys, hostnames)
+wifiscope_*.md
+triage*.md
+*_triage.md
+*.drawio
+
+# scratch
+*.tmp
+*.bak

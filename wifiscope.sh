@@ -1,0 +1,794 @@
+#!/usr/bin/env bash
+#
+# wifiscope.sh — interactive 802.11 pcap triage with tshark
+# -----------------------------------------------------------------------------
+# Answers the usual wifi-forensics questions from a monitor-mode capture:
+#   SSID/channel/band, encryption, make/model, clients, PSK/PTK/GTK counts,
+#   mesh AP count, and (after decryption) subnet + host inventory.
+#
+# Two ways to run it:
+#   Interactive :  ./wifiscope.sh                 # asks for a pcap, shows a menu
+#                  ./wifiscope.sh capture.pcapng  # same, pcap pre-loaded
+#   One-shot    :  ./wifiscope.sh <command> capture.pcapng [SSID] [passphrase]
+#                  e.g. ./wifiscope.sh crypto capture.pcapng Ahmed_Shebakah
+#
+# Commands (also the menu items): recon bands crypto hardware clients keys
+#                                 topology hosts report
+#
+# Only needs: tshark, plus coreutils (awk, sort, grep, tr, sed). Nothing else.
+# -----------------------------------------------------------------------------
+
+# We deliberately do NOT use `set -e`: many tshark|grep pipelines exit non-zero
+# simply because a filter matched nothing, and that must not kill the script.
+# `set -u` (error on unset var) + pipefail still catch real mistakes.
+set -uo pipefail
+
+# ---- globals ----------------------------------------------------------------
+# Override the tshark path if it isn't on $PATH:  TSHARK=/opt/wireshark/bin/tshark ./wifiscope.sh
+TSHARK="${TSHARK:-tshark}"
+
+PCAP=""              # capture file we're working on
+SSID=""             # the target network name (once selected)
+PASS=""             # WPA passphrase (optional, for decryption)
+DEC=()              # tshark decryption args, REBUILT from the keyring (empty = off)
+KEYRING=""          # path to <pcap>.keys — the harvested key store (UAT lines)
+TGT_BSSIDS=()       # every BSSID advertising the target SSID
+ALL_BSSIDS=()       # every BSSID in the whole capture (used to spot non-AP MACs)
+
+# ---- color / UX -------------------------------------------------------------
+# Color + clickable links turn ON for a real terminal (or WIFISCOPE_FORCE_COLOR=1)
+# and OFF when piped or NO_COLOR is set — so the report export and any pipes stay
+# clean, plain text. This is why we can decorate freely without breaking parsing.
+if [ -n "${WIFISCOPE_FORCE_COLOR:-}" ] || { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; }; then
+  C_RESET=$'\e[0m'; C_B=$'\e[1m'; C_DIM=$'\e[2m'
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'
+  C_BLU=$'\e[34m'; C_MAG=$'\e[35m'; C_CYN=$'\e[36m'; C_ORG=$'\e[38;5;208m'
+  UX_LINKS=1
+else
+  C_RESET=; C_B=; C_DIM=; C_RED=; C_GRN=; C_YEL=; C_BLU=; C_MAG=; C_CYN=; C_ORG=; UX_LINKS=0
+fi
+
+# hlink URL TEXT: an OSC-8 clickable terminal hyperlink (plain TEXT if links off).
+hlink() {
+  if [ "$UX_LINKS" = 1 ]; then printf '\e]8;;%s\e\\%s\e]8;;\e\\' "$1" "$2"; else printf '%s' "$2"; fi
+}
+
+# ---- output helpers ---------------------------------------------------------
+# section: a bold, colored, skimmable header (emoji lives in the passed string).
+section() { printf '\n%s── %s ──%s\n' "$C_B$C_CYN" "$*" "$C_RESET"; }
+# note/ok/die: status lines to stderr, so they never pollute piped data or reports.
+note()    { printf '%s  · %s%s\n' "$C_DIM$C_YEL" "$*" "$C_RESET" >&2; }
+ok()      { printf '%s  ✔ %s%s\n' "$C_GRN" "$*" "$C_RESET" >&2; }
+die()     { printf '%s✖ %s%s\n' "$C_B$C_RED" "$*" "$C_RESET" >&2; exit 1; }
+
+# need: bail early with a clear message if a required program is missing.
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# paint: colorize a DATA stream for display — MACs by role (target BSSID = bold
+# cyan, other AP = blue, client = green) each linked to a vendor OUI lookup, and
+# IPv4 in yellow. A no-op when color is off, so it's only ever applied to output
+# we're about to show (never to data we parse). Portable regex (no {n} intervals
+# for mawk). Used at the dispatch layer on read-only display commands.
+paint() {
+  [ -n "$C_RESET" ] || { cat; return; }
+  awk -v T="${TGT_BSSIDS[*]}" -v A="${ALL_BSSIDS[*]}" -v links="$UX_LINKS" \
+      -v cyn="$C_B$C_CYN" -v blu="$C_BLU" -v grn="$C_GRN" -v yel="$C_YEL" -v rst="$C_RESET" '
+    BEGIN{ h="[0-9A-Fa-f][0-9A-Fa-f]"; RE=h":"h":"h":"h":"h":"h;
+           n=split(T,x," "); for(i=1;i<=n;i++) TT[tolower(x[i])]=1;
+           m=split(A,y," "); for(i=1;i<=m;i++) AA[tolower(y[i])]=1; }
+    {
+      s=$0; out="";
+      while (match(s, RE)) {
+        pre=substr(s,1,RSTART-1); mac=substr(s,RSTART,RLENGTH); s=substr(s,RSTART+RLENGTH);
+        lm=tolower(mac);
+        col=(lm in TT)?cyn:((lm in AA)?blu:grn);
+        if (links=="1")
+          out=out pre col "\033]8;;https://maclookup.app/search/result?mac=" mac "\033\\" mac "\033]8;;\033\\" rst;
+        else
+          out=out pre col mac rst;
+      }
+      out=out s;
+      gsub(/[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/, yel"&"rst, out);
+      print out;
+    }'
+}
+
+# banner: a little launch flourish (color only).
+banner() {
+  [ -n "$C_RESET" ] || return
+  printf '%s\n  📡 %swifiscope%s%s — 802.11 pcap triage & key harvesting%s\n' \
+    "$C_CYN" "$C_B" "$C_RESET$C_CYN" "$C_DIM" "$C_RESET"
+}
+
+# ---- tshark wrappers --------------------------------------------------------
+# ts:  run tshark on the loaded pcap WITHOUT decryption keys.
+#      It first echoes the exact command (to stderr) so you can read/copy/learn
+#      it, then actually runs it. Use this for anything in cleartext management
+#      frames: beacons, WPS, RSN, association, 4-address backhaul.
+ts() {
+  printf '%s  $ tshark -r %q %s%s\n' "$C_DIM$C_GRN" "$PCAP" "$*" "$C_RESET" >&2
+  # `tr -d '\r'` strips carriage returns so sort -u/grep behave when the pcap is
+  # read by a Windows tshark.exe (CRLF output). On Linux it's a harmless no-op.
+  "$TSHARK" -r "$PCAP" "$@" | tr -d '\r'
+}
+
+# tsd: like ts() but ALSO passes the decryption keys ("${DEC[@]}").
+#      Use this for anything that only exists once traffic is decrypted:
+#      ARP, DHCP, mDNS, the GTK inside handshake message 3, host inventory.
+#      If no key has been set it warns and just runs in the clear.
+tsd() {
+  if [ "${#DEC[@]}" -eq 0 ]; then
+    note "no decryption key set — run 'k' (menu) or pass a passphrase; results may be empty"
+  fi
+  printf '%s  $ tshark -r %q [+keys] %s%s\n' "$C_DIM$C_GRN" "$PCAP" "$*" "$C_RESET" >&2
+  "$TSHARK" -r "$PCAP" "${DEC[@]}" "$@" | tr -d '\r'
+}
+
+# ---- filter helpers ---------------------------------------------------------
+# beacons_of_target: display filter for "beacon frames of the chosen SSID".
+#   subtype 8 == beacon.  wlan.ssid only exists in beacon/probe/assoc frames.
+beacons_of_target() { printf 'wlan.fc.type_subtype==8 && wlan.ssid=="%s"' "$SSID"; }
+
+# bssid_filter: OR-together every target BSSID -> "(wlan.bssid==a || wlan.bssid==b)".
+#   EAPOL/data frames carry no SSID, so we scope them by the AP's BSSIDs instead.
+bssid_filter() {
+  local out="" b
+  for b in "${TGT_BSSIDS[@]}"; do out+="${out:+ || }wlan.bssid==$b"; done
+  printf '(%s)' "${out:-wlan.bssid==00:00:00:00:00:00}"
+}
+
+# dessid [COL]: decode a hex-encoded SSID in TAB column COL (default 2) to text.
+#   tshark renders wlan.ssid as hex under -T fields, so "Ahmed_Shebakah" comes out
+#   as 41686d65...; this makes it human-readable (and, in pick_ssid, selectable).
+#   Portable — builds a hex table in awk instead of using gawk-only strtonum().
+dessid() {
+  awk -F'\t' -v col="${1:-2}" 'BEGIN{OFS="\t"; for(i=0;i<16;i++){c=sprintf("%x",i);H[c]=i;H[toupper(c)]=i}}
+    { v=$col;
+      if(length(v)>0 && length(v)%2==0 && v ~ /^[0-9A-Fa-f]+$/){ s="";
+        for(i=1;i<=length(v);i+=2) s=s sprintf("%c", H[substr(v,i,1)]*16+H[substr(v,i+1,1)]);
+        $col=s }
+      print }'
+}
+
+# ---- loading / selection ----------------------------------------------------
+# load_pcap: validate the file and cache every BSSID in the capture (used later
+#            to tell APs apart from client stations).
+load_pcap() {
+  PCAP="$1"
+  [ -f "$PCAP" ] || die "no such file: $PCAP"
+  note "indexing capture (one pass to list all BSSIDs)..."
+  mapfile -t ALL_BSSIDS < <(
+    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.bssid 2>/dev/null \
+      | tr -d '\r' | sort -u | grep .
+  )
+  note "capture has ${#ALL_BSSIDS[@]} beaconing BSSIDs"
+  # The keyring lives next to the pcap and persists between runs.
+  KEYRING="${PCAP}.keys"
+  rebuild_dec
+  [ -s "$KEYRING" ] && note "loaded $(grep -c . "$KEYRING") key(s) from $KEYRING"
+}
+
+# pick_ssid: list the SSIDs in the capture (with how many BSSIDs each spans) and
+#            let the user choose the target. This is the "single network" scope:
+#            you must see the names before you can focus on one.
+pick_ssid() {
+  section "networks in this capture"
+  # Build a numbered list of unique, non-empty SSIDs.
+  mapfile -t names < <(
+    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.ssid 2>/dev/null \
+      | tr -d '\r' | dessid 1 | sort | uniq -c | sort -rn | sed 's/^ *//' \
+      | grep -v '^[0-9]* *$' | grep -v '<MISSING>'   # drop hidden / blank SSIDs from the picker
+  )
+  local i=1
+  for line in "${names[@]}"; do printf '  %2d) %s\n' "$i" "$line"; i=$((i+1)); done
+  printf 'select target SSID number (or type a name): '
+  read -r choice || die "no input"
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ]; then
+    # Strip the leading "  <count> " to recover just the SSID text.
+    SSID="$(printf '%s\n' "${names[$((choice-1))]}" | sed 's/^[0-9]* *//')"
+  else
+    SSID="$choice"
+  fi
+  [ -n "$SSID" ] || die "no SSID selected"
+  load_target_bssids
+  note "target SSID: $SSID  (${#TGT_BSSIDS[@]} BSSIDs)"
+}
+
+# load_target_bssids: cache the BSSIDs that advertise the chosen SSID.
+load_target_bssids() {
+  mapfile -t TGT_BSSIDS < <(
+    "$TSHARK" -r "$PCAP" -Y "$(beacons_of_target)" -T fields -e wlan.bssid 2>/dev/null \
+      | tr -d '\r' | sort -u | grep .
+  )
+}
+
+# set_key: ask for the WPA passphrase, store it in the keyring, and rebuild DEC.
+#   The wpa-pwd entry lets tshark derive the PMK and every client PTK on its own.
+#   The PMK depends on passphrase AND SSID, which is why the SSID is chosen first.
+set_key() {
+  [ -n "$SSID" ] || { note "choose an SSID first (needed to derive the key)"; return; }
+  printf 'WPA passphrase for "%s" (blank = skip): ' "$SSID"
+  read -r PASS || PASS=""
+  if [ -n "$PASS" ]; then
+    kr_add wpa-pwd "$PASS:$SSID"
+    rebuild_dec
+    note "decryption enabled (wpa-pwd added to keyring)"
+  else
+    note "no passphrase entered"
+  fi
+}
+
+# =============================================================================
+#  KEYRING  — harvest key material (PSK / PTK-TK / GTK) and feed it back into
+#  tshark so later passes decrypt more. All keys live in one per-pcap file and
+#  every tshark call rebuilds its decryption args from it.
+# =============================================================================
+
+# kr_add TYPE VALUE: append a key to the keyring, skipping exact duplicates.
+#   TYPE is a tshark UAT key type: wpa-pwd | wpa-psk | tk | wep | msk.
+#   Stored as "type<TAB>value" so values containing ':' (wpa-pwd) stay intact.
+kr_add() {
+  local line; line="$(printf '%s\t%s' "$1" "$2")"
+  [ -n "$KEYRING" ] || { note "no keyring path set (load a pcap first)"; return; }
+  touch "$KEYRING"
+  grep -Fxq "$line" "$KEYRING" 2>/dev/null || printf '%s\n' "$line" >> "$KEYRING"
+}
+
+# rebuild_dec: turn the keyring file into tshark args in DEC[].
+#   Each key becomes its own  -o uat:80211_keys:"type","value"  (tshark APPENDS
+#   one UAT record per -o), plus a single enable-decryption switch up front.
+rebuild_dec() {
+  DEC=()
+  [ -n "$KEYRING" ] && [ -s "$KEYRING" ] || return
+  DEC=(-o wlan.enable_decryption:TRUE)
+  local t v
+  while IFS=$'\t' read -r t v; do
+    [ -n "$t" ] || continue
+    DEC+=(-o "uat:80211_keys:\"$t\",\"$v\"")
+  done < "$KEYRING"
+}
+
+# pmk_hex: compute the 256-bit PMK/PSK from passphrase + SSID (WPA2-PSK).
+#   PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096 iters, 32 bytes). Deterministic,
+#   so this IS the network's PSK in raw hex — usable as a wpa-psk key.
+pmk_hex() {
+  python3 - "$PASS" "$SSID" <<'PY'
+import sys, hashlib, binascii
+print(binascii.hexlify(hashlib.pbkdf2_hmac('sha1', sys.argv[1].encode(),
+      sys.argv[2].encode(), 4096, 32)).decode())
+PY
+}
+
+# derive_psk: harvest the PSK/PMK into the keyring as a wpa-psk entry.
+derive_psk() {
+  [ -n "$PASS" ] && [ -n "$SSID" ] || { note "need passphrase+SSID for PSK"; return; }
+  local pmk; pmk="$(pmk_hex)"
+  [ -n "$pmk" ] && { kr_add wpa-psk "$pmk"; note "PSK/PMK: $pmk"; }
+}
+
+# harvest_ptk: compute each client's PTK-TK and add it to the keyring as a tk.
+#   tshark never prints the PTK it derives, so we compute it ourselves:
+#     B   = min(AA,SPA)||max(AA,SPA)||min(ANonce,SNonce)||max(ANonce,SNonce)
+#     PTK = PRF-384(PMK, "Pairwise key expansion", B)   (HMAC-SHA1 blocks)
+#     TK  = PTK[32:48]   (KCK16 | KEK16 | TK16, CCMP)
+#   ANonce comes from msg1/msg3 (AP side), SNonce from msg2 (STA side) — all
+#   cleartext in the EAPOL frames, so no decryption is needed to read them.
+harvest_ptk() {
+  [ -n "$PASS" ] && [ -n "$SSID" ] || { note "need passphrase+SSID for PTKs"; return; }
+  local pmk; pmk="$(pmk_hex)"
+  # IMPORTANT: python must read the tshark rows on STDIN, so the program cannot
+  # also come from stdin — `python3 -` would consume the here-doc instead of the
+  # piped data. Load the script into a variable and pass it with `python3 -c`.
+  local PTK_PY
+  read -r -d '' PTK_PY <<'PY'
+import sys, hmac, hashlib, binascii
+pmk = binascii.unhexlify(sys.argv[1])
+mac = lambda m: binascii.unhexlify(m.replace(':', ''))
+def prf(key, A, B, n):                       # IEEE 802.11 PRF using HMAC-SHA1
+    R = b''; i = 0
+    while len(R) < n:
+        R += hmac.new(key, A + b'\x00' + B + bytes([i]), hashlib.sha1).digest(); i += 1
+    return R[:n]
+S = {}
+for ln in sys.stdin:
+    p = ln.rstrip('\n').split('\t')
+    if len(p) < 4 or not p[3]:               # need a nonce
+        continue
+    sa, da, m, nh = p[0], p[1], p[2], p[3]
+    try: n = binascii.unhexlify(nh)
+    except Exception: continue
+    if m in ('1', '3'): ap, sta, an, sn = sa, da, n, None   # AP sends ANonce
+    elif m == '2':      ap, sta, an, sn = da, sa, None, n    # STA sends SNonce
+    else: continue
+    e = S.setdefault((ap, sta), {'an': None, 'sn': None})
+    if an: e['an'] = an
+    if sn: e['sn'] = sn
+for (ap, sta), e in S.items():
+    if not (e['an'] and e['sn']): continue   # need both nonces
+    aa, spa = mac(ap), mac(sta)
+    B = min(aa, spa) + max(aa, spa) + min(e['an'], e['sn']) + max(e['an'], e['sn'])
+    tk = prf(pmk, b'Pairwise key expansion', B, 48)[32:48]
+    print('%s\t%s\t%s' % (sta, ap, binascii.hexlify(tk).decode()))
+PY
+  local out
+  out="$(ts -Y "wlan_rsna_eapol.keydes.msgnr in {1,2,3} && $(bssid_filter)" -T fields \
+        -e wlan.sa -e wlan.da -e wlan_rsna_eapol.keydes.msgnr -e wlan_rsna_eapol.keydes.nonce \
+        | python3 -c "$PTK_PY" "$pmk")"
+  [ -n "$out" ] || { note "no complete handshakes (need both nonces) to derive PTKs"; return; }
+  local sta ap tk
+  while IFS=$'\t' read -r sta ap tk; do
+    [ -n "$tk" ] || continue
+    kr_add tk "$tk"
+    note "PTK-TK  $sta @ $ap  ->  $tk"
+  done <<< "$out"
+}
+
+# harvest_gtk: extract every recoverable GTK for the TARGET SSID as a tk.
+#   Filters on the GTK KDE itself (not just 4-way msg3), so it also catches GTKs
+#   handed out in group-key REKEY handshakes. Needs decryption already working
+#   (a key must decrypt the KEK-encrypted key data first).
+harvest_gtk() {
+  rebuild_dec
+  local g
+  g="$(tsd -Y "wlan.rsn.ie.gtk_kde.gtk && $(bssid_filter)" -T fields \
+       -e wlan.rsn.ie.gtk_kde.gtk 2>/dev/null | sort -u | grep .)"
+  [ -n "$g" ] || { note "no GTKs recoverable (need a decryptable handshake)"; return; }
+  local gtk
+  while read -r gtk; do
+    [ -n "$gtk" ] || continue
+    kr_add tk "$gtk"
+    note "GTK -> $gtk"
+  done <<< "$g"
+}
+
+# scrapegtk: sweep the WHOLE capture (every SSID/BSS) for any recoverable GTK and
+#   add each unique one to the keyring. Broader than harvest_gtk, which is scoped
+#   to the chosen network. Same requirement: a working key must decrypt the GTK
+#   KDE (the group key is carried encrypted inside the handshake). Reports which
+#   BSS each GTK came from so you know what it unlocks.
+scrapegtk() {
+  section "scraping GTKs from whole capture"
+  local rows
+  rows="$(tsd -Y 'wlan.rsn.ie.gtk_kde.gtk' -T fields \
+          -e wlan.sa -e wlan.rsn.ie.gtk_kde.gtk 2>/dev/null | sort -u | grep .)"
+  [ -n "$rows" ] || { note "no GTKs recoverable — add the passphrase/PMK or a TK first (k/harvest/addkey)"; return; }
+  local sa gtk
+  while IFS=$'\t' read -r sa gtk; do
+    [ -n "$gtk" ] || continue
+    kr_add tk "$gtk"
+    note "GTK  from $sa  ->  $gtk"
+  done <<< "$rows"
+  rebuild_dec
+  local ngtk; ngtk="$(printf '%s\n' "$rows" | awk -F'\t' '{print $2}' | sort -u | grep -c .)"
+  note "scraped $ngtk unique GTK(s); keyring now holds $(grep -c . "$KEYRING") key(s)"
+}
+
+# harvest: do all three (PSK, PTK, GTK), then reload DEC so everything after
+#   this point decrypts with the full keyring.
+harvest() {
+  [ -n "$PASS" ] || { note "set a passphrase first ('k') — needed to derive PSK/PTK"; return; }
+  section "harvesting keys for $SSID"
+  derive_psk
+  rebuild_dec           # PSK usable now, so GTK extraction can decrypt msg3
+  harvest_ptk
+  harvest_gtk
+  rebuild_dec
+  keyring
+}
+
+# keyring: show the current key store.
+keyring() {
+  section "🗝️  keyring: $(hlink "file://$KEYRING" "${KEYRING:-<none>}")"
+  if [ -n "$KEYRING" ] && [ -s "$KEYRING" ]; then
+    awk -F'\t' -v c="$C_MAG" -v r="$C_RESET" '{printf "  %s%-8s%s %s\n", c,$1,r,$2}' "$KEYRING"
+    printf '%stotal keys:%s %s\n' "$C_B" "$C_RESET" "$(grep -c . "$KEYRING")"
+  else
+    echo "  (empty — set a passphrase 'k' or run harvest 'h')"
+  fi
+}
+
+# is_hex STR: true if STR is only hex digits (used to sanity-check key material).
+is_hex() { [[ "$1" =~ ^[0-9a-fA-F]+$ ]]; }
+
+# addkey TYPE VALUE: add an EXTERNALLY-supplied key to the keyring.
+#   Use this when another tool (oxide, hcxtools, a hostapd log, a vendor dump)
+#   gives you key material the capture itself can't yield — e.g. a GTK for a BSS
+#   whose handshake wasn't captured. Combined with the passphrase, that GTK lets
+#   you decrypt that BSS's broadcast/multicast and see more of the network.
+#   TYPE is a tshark UAT type: wpa-pwd | wpa-psk | tk | wep | msk.
+#     tk       = 128-bit temporal key, 32 hex chars (a client PTK-TK *or* a GTK)
+#     wpa-psk  = 256-bit PMK, 64 hex chars
+#     wpa-pwd  = passphrase[:ssid] (free-form)
+addkey() {
+  local type="${1:-}" val="${2:-}"
+  if [ -z "$type" ] || [ -z "$val" ]; then          # interactive prompt
+    printf 'key type (wpa-pwd|wpa-psk|tk|wep|msk): '; read -r type || return
+    printf 'value: '; read -r val || return
+  fi
+  case "$type" in
+    tk)      is_hex "$val" && [ "${#val}" -eq 32 ] || { note "tk must be 32 hex chars (128-bit)"; return; } ;;
+    wpa-psk) is_hex "$val" && [ "${#val}" -eq 64 ] || { note "wpa-psk must be 64 hex chars (256-bit)"; return; } ;;
+    wep|msk) is_hex "$val" || { note "$type expects hex"; return; } ;;
+    wpa-pwd) : ;;                                    # passphrase[:ssid], anything goes
+    *)       note "unknown key type '$type' (use wpa-pwd|wpa-psk|tk|wep|msk)"; return ;;
+  esac
+  kr_add "$type" "$val"
+  rebuild_dec
+  note "added $type key — keyring now holds $(grep -c . "$KEYRING") key(s)"
+}
+
+# import FILE: bulk-load keys from a file. Forgiving about format, one key/line:
+#     - "tk","38548d..."        (Wireshark UAT export style)
+#     - tk,38548d...   /  tk 38548d...   /  tk<TAB>38548d...
+#     - 38548d3d1b3c...         (bare 32-hex  -> assumed tk / GTK)
+#     - 6689e1...<64 hex>       (bare 64-hex  -> assumed wpa-psk / PMK)
+#     - lines starting with #   (comments, ignored)
+#   Anything it can't classify is reported and skipped, never guessed wrongly.
+import() {
+  local f="${1:-}"
+  [ -z "$f" ] && { printf 'key file to import: '; read -e -r f || return; }
+  [ -f "$f" ] || { note "no such file: $f"; return; }
+  local added=0 type val line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"                                            # strip CR
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"  # trim
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac                          # comment
+    type=""; val=""
+    if [[ "$line" =~ ^\"?(wpa-pwd|wpa-psk|tk|wep|msk)\"?[[:space:],]+\"?(.+)$ ]]; then
+      type="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]%\"}"       # explicit type,value
+    elif is_hex "$line" && [ "${#line}" -eq 32 ]; then type=tk;      val="$line"
+    elif is_hex "$line" && [ "${#line}" -eq 64 ]; then type=wpa-psk; val="$line"
+    else note "skip (unrecognized): $line"; continue
+    fi
+    kr_add "$type" "$val"; added=$((added+1))
+  done < "$f"
+  rebuild_dec
+  note "imported $added key(s)"
+  keyring
+}
+
+# =============================================================================
+#  ANALYSIS FUNCTIONS  — one per question type. Each says what it answers,
+#  which frames/fields it reads, and why.
+# =============================================================================
+
+# recon: whole-capture survey. Protocol mix + every beacon's identity/channel.
+#   WHY: orient yourself before drilling in — see all SSIDs, BSSIDs, bands.
+recon() {
+  section "🛰️  protocol hierarchy"
+  ts -q -z io,phs
+  section "📇 all beacons: bssid / ssid / 2.4ch / 5ch / freq"
+  ts -Y 'wlan.fc.type_subtype==8' -T fields \
+     -e wlan.bssid -e wlan.ssid -e wlan.ds.current_channel \
+     -e wlan.ht.info.primarychannel -e radiotap.channel.freq | dessid 2 | sort -u
+}
+
+# bands: channel + band for each BSSID of the target SSID.
+#   WHY: 2.4GHz carries channel in the DSSS tag (wlan.ds.current_channel),
+#        5GHz carries it in the HT tag (wlan.ht.info.primarychannel). Radiotap
+#        frequency (>5000 MHz = 5GHz) is the tie-breaker.
+bands() {
+  section "📶 bands / channels for $SSID"
+  ts -Y "$(beacons_of_target)" -T fields \
+     -e wlan.bssid -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \
+     -e radiotap.channel.freq \
+    | sort -u \
+    | awk '{band=($4>5000)?"5GHz":"2.4GHz"; printf "%-20s ch%-4s %s (%s MHz)\n",$1,($4>5000?$3:$2),band,$4}'
+}
+
+# crypto: read the RSN element and translate AKM suites into a plain verdict.
+#   WHY: AKM 2 = PSK (WPA2), 8 = SAE (WPA3). Both present (usually with MFP) =
+#        WPA2/WPA3 transition. None = open/WEP.
+crypto() {
+  section "🔐 encryption for $SSID"
+  ts -Y "$(beacons_of_target)" -T fields \
+     -e wlan.bssid -e wlan.rsn.akms.type \
+     -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr | sort -u
+  # Collapse all AKM types seen across the target's beacons into one verdict.
+  local akms
+  akms="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.rsn.akms.type 2>/dev/null \
+          | tr ',' '\n' | tr -d ' ' | sort -u | grep .)"
+  local has2=0 has8=0
+  grep -qx 2 <<<"$akms" && has2=1
+  grep -qx 8 <<<"$akms" && has8=1
+  local v
+  if   [ $has2 = 1 ] && [ $has8 = 1 ]; then v="${C_YEL}WPA2/WPA3 transition (PSK + SAE)${C_RESET}"
+  elif [ $has8 = 1 ];                  then v="${C_GRN}WPA3 (SAE)${C_RESET}"
+  elif [ $has2 = 1 ];                  then v="${C_YEL}WPA2 (PSK)${C_RESET}"
+  else v="${C_RED}no RSN AKM found (open/WEP?)${C_RESET}"; fi
+  printf '%s🔒 verdict:%s %s\n' "$C_B" "$C_RESET" "$v"
+}
+
+# hardware: pull make/model out of the WPS information element in beacons.
+#   WHY: APs advertise Manufacturer / Model Name / Model Number in WPS. These
+#        map directly to "make" and "model" questions.
+hardware() {
+  section "🏷️  make / model (WPS) for $SSID"
+  ts -Y "wps.model_name && $(bssid_filter)" -T fields \
+     -e wlan.bssid -e wps.manufacturer -e wps.model_name \
+     -e wps.model_number -e wps.device_name -e wps.serial_number | sort -u
+}
+
+# clients: list the wireless stations on the target network.
+#   WHY: association requests are often lost to channel hopping, so we use the
+#        4-way handshakes as ground truth — one non-AP MAC per handshake. Any MAC
+#        that is itself a BSSID is the AP side, so we filter those out.
+clients() {
+  section "👥 wireless clients on $SSID (from EAPOL handshakes)"
+  ts -Y "eapol && $(bssid_filter)" -T fields \
+     -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr
+  section "distinct client MACs"
+  # sa/da flattened, de-duped, with every known BSSID removed -> just stations.
+  ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da \
+    | tr '\t' '\n' | sort -u | grep . \
+    | { if [ "${#ALL_BSSIDS[@]}" -gt 0 ]; then grep -vwF -f <(printf '%s\n' "${ALL_BSSIDS[@]}"); else cat; fi; }
+}
+
+# keys: count PSKs, PTKs, and GTKs — and explain each number.
+#   WHY:
+#     PSK  = passphrase+SSID pairs -> one network, one passphrase = 1 PSK.
+#     PTK  = per client<->AP session -> one per distinct handshake/client.
+#     GTK-in-use   = per BSS (fronthaul BSSID) -> APs x active bands.
+#     GTK-recovered= only handshakes complete enough to derive the PTK/KEK; a
+#                    handshake missing msg1 leaves the GTK blank.
+keys() {
+  section "🔑 keys for $SSID"
+  printf '%sPSK:%s 1  (single passphrase + single ESSID %s)\n' "$C_B" "$C_RESET" "$SSID"
+
+  local nclients
+  nclients="$(ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da \
+              | tr '\t' '\n' | sort -u | grep . \
+              | { if [ "${#ALL_BSSIDS[@]}" -gt 0 ]; then grep -vwF -f <(printf '%s\n' "${ALL_BSSIDS[@]}"); else cat; fi; } \
+              | wc -l | tr -d ' ')"
+  echo "PTK: $nclients  (one per client that completed a 4-way handshake)"
+
+  echo "GTK in use: ${#TGT_BSSIDS[@]}  (one per fronthaul BSS = APs x active bands)"
+
+  section "GTKs actually recovered (decrypted msg3)"
+  tsd -Y "wlan_rsna_eapol.keydes.msgnr==3 && $(bssid_filter)" -T fields \
+      -e wlan.sa -e wlan.rsn.ie.gtk_kde.gtk | sort -u
+  local grec
+  grec="$(tsd -Y "wlan_rsna_eapol.keydes.msgnr==3 && $(bssid_filter)" -T fields \
+          -e wlan.rsn.ie.gtk_kde.gtk 2>/dev/null | sort -u | grep -c .)"
+  echo "GTK recovered: $grec"
+}
+
+# topology: is it one AP, several in an ESS, or a mesh? And how many physical units?
+#   WHY: same SSID on many BSSIDs = an ESS. Count PHYSICAL units by the wireless
+#        backhaul, not by OUI — vendors ship packs with consecutive factory MACs,
+#        so two boxes can share a prefix. 4-address frames (ToDS=1 & FromDS=1) are
+#        the WDS backhaul; a satellite's backhaul-STA joining the root proves a
+#        distinct unit. No mesh IE + backhaul = "backhaul ESS" (fake mesh), not 802.11s.
+topology() {
+  section "🕸️  fronthaul BSSes for $SSID (= GTKs in use)"
+  printf '%s\n' "${TGT_BSSIDS[@]}"
+  echo "count: ${#TGT_BSSIDS[@]}"
+  section "802.11 WDS backhaul (4-address) links: transmitter -> receiver"
+  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra | sort -u
+  section "backhaul frame count"
+  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' | wc -l
+  note "count physical APs = distinct units in the backhaul (root + each satellite backhaul-STA)"
+}
+
+# hosts: everything that needs decryption — subnet, IP<->MAC, names, versions.
+#   WHY: broadcast/multicast (ARP, DHCP, mDNS) decrypt with the GTK, and that's
+#        where subnet and device identity live. A device seen here but never in a
+#        handshake is WIRED, not a wireless client.
+hosts() {
+  section "🏠 decryption sanity (ARP/IP frames after decrypt)"
+  tsd -Y 'arp || ip' | wc -l
+  section "subnet / gateway (DHCP options 1 & 3)"
+  tsd -Y 'dhcp' -T fields \
+      -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u
+  section "DHCP fingerprint (mac / ip / hostname / vendor-class)"
+  tsd -Y 'dhcp' -T fields \
+      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
+      -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u
+  section "ARP IP <-> MAC"
+  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac | sort -u
+  section "hostname sweep (DHCP / NBNS / mDNS / LLMNR)"
+  tsd -Y 'dhcp.option.hostname || nbns || mdns || llmnr' -T fields \
+      -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.qry.name | sort -u
+  section "software versions (HTTP / SSH banners)"
+  tsd -Y 'http.user_agent || http.server || ssh.protocol' -T fields \
+      -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u
+}
+
+# pmkid: list RSN PMKIDs (carried in EAPOL msg1). A PMKID cracks OFFLINE with no
+#   client traffic needed — it's the fastest path to the passphrase. Zeroed
+#   PMKIDs (all-00) are filtered out.
+pmkid() {
+  section "🪪 PMKIDs (offline-crackable, client-less)"
+  ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
+     -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid | awk -F'\t' '$3 !~ /^0*$/' | sort -u
+}
+
+# export22000: write a hashcat-22000 file to crack with:  hashcat -m 22000 <file>
+#   Uses hcxpcapngtool when present (handles PMKID *and* EAPOL handshakes fully).
+#   Without it, falls back to building PMKID (WPA*01) lines directly — reliable,
+#   though EAPOL (*02) lines then need hcxpcapngtool.
+export22000() {
+  local out="${1:-${PCAP%.*}.hc22000}"
+  if command -v hcxpcapngtool >/dev/null 2>&1; then
+    hcxpcapngtool -o "$out" "$PCAP" >/dev/null 2>&1
+    [ -s "$out" ] && ok "wrote $(hlink "file://$out" "$out")  (hcxpcapngtool: PMKID + EAPOL)" \
+                  || note "hcxpcapngtool found nothing to export"
+    return
+  fi
+  note "hcxpcapngtool not installed — exporting PMKID (WPA*01) lines only"
+  local ehex; ehex="$(python3 -c 'import sys;print(sys.argv[1].encode().hex())' "$SSID")"
+  ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
+     -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid \
+    | awk -F'\t' -v e="$ehex" '$3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
+        printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | sort -u > "$out"
+  if [ -s "$out" ]; then ok "wrote $(hlink "file://$out" "$out")  ($(grep -c . "$out") PMKID line(s))"
+  else note "no PMKIDs in this capture to export"; rm -f "$out"; fi
+}
+
+# probes: what SSIDs each client is actively looking for (directed probe requests).
+#   Reveals networks a device has joined before — strong profiling/tracking signal.
+#   Whole-capture (probes aren't tied to one AP); wildcard/blank probes skipped.
+probes() {
+  section "🔎 probe requests: client → SSID sought"
+  ts -Y 'wlan.fc.type_subtype==4 && wlan.ssid != ""' -T fields -e wlan.sa -e wlan.ssid \
+    | awk -F'\t' 'NF==2 && $2!=""' | dessid 2 | sort -u
+}
+
+# handshakes: per client, which 4-way messages were captured and whether that's
+#   enough to derive keys / crack. (m1&m2) or (m2&m3) => PTK-derivable & crackable.
+handshakes() {
+  section "🤝 handshake completeness (per client)"
+  ts -Y "eapol && $(bssid_filter)" -T fields \
+     -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr \
+   | awk -v aps="${ALL_BSSIDS[*]}" '
+       BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
+       { if($4=="")next; sa=tolower($1); sta=(sa in AP)?$2:$1; k=sta"|"$3; M[k]=M[k] $4 }
+       END{ for(k in M){ split(k,p,"|"); s=M[k];
+              h1=index(s,"1")>0;h2=index(s,"2")>0;h3=index(s,"3")>0;h4=index(s,"4")>0;
+              crack=((h1&&h2)||(h2&&h3))?"YES":"no";
+              printf "%-18s @ %-18s  msgs:%s%s%s%s  crackable:%s\n",
+                     p[1],p[2], h1?"1":"·",h2?"2":"·",h3?"3":"·",h4?"4":"·", crack } }' | sort
+}
+
+# delkey VALUE|all: remove key(s) from the keyring by matching value (or wipe all).
+delkey() {
+  local v="${1:-}"
+  [ -n "$KEYRING" ] && [ -s "$KEYRING" ] || { note "keyring empty"; return; }
+  [ -z "$v" ] && { keyring; printf 'value to remove (or "all"): '; read -e -r v || return; }
+  if [ "$v" = all ]; then : > "$KEYRING"; rebuild_dec; ok "cleared keyring"; return; fi
+  grep -vF "$v" "$KEYRING" > "$KEYRING.tmp" 2>/dev/null && mv "$KEYRING.tmp" "$KEYRING"
+  rebuild_dec; ok "removed keys matching '$v' — $(grep -c . "$KEYRING" 2>/dev/null || echo 0) left"
+}
+
+# clearkey: wipe the whole keyring.
+clearkey() { [ -n "$KEYRING" ] && : > "$KEYRING"; rebuild_dec; ok "keyring cleared"; }
+
+# report: run every section into a markdown file. tshark's teaching lines go to
+#         stderr, so 2>/dev/null keeps the report clean (data only).
+report() {
+  local out="${1:-wifiscope_${SSID:-report}.md}"
+  # Dynamic scope: blanking the color vars here makes every called function emit
+  # PLAIN text, so the markdown never contains ANSI escapes.
+  local C_RESET= C_B= C_DIM= C_RED= C_GRN= C_YEL= C_BLU= C_MAG= C_CYN= C_ORG= UX_LINKS=0
+  {
+    echo "# wifiscope report — ${SSID:-unknown}"
+    echo
+    echo "- pcap: \`$PCAP\`"
+    echo "- generated by wifiscope.sh"
+    for fn in recon bands crypto hardware clients handshakes keys topology hosts probes; do
+      echo; echo "## $fn"; echo '```'
+      "$fn"
+      echo '```'
+    done
+  } > "$out" 2>/dev/null
+  ok "wrote $out"
+}
+
+# =============================================================================
+#  DRIVER
+# =============================================================================
+
+# menu: the interactive loop. Each letter/number maps to one analysis function.
+menu() {
+  banner
+  while true; do
+    # Read-only ANALYZE/CRACK items are piped through `paint` (role-colored MACs +
+    # vendor links). State-changing KEYS/SESSION items run direct — a pipe would
+    # run them in a subshell and lose the globals they set.
+    local kn; kn="$([ -s "${KEYRING:-/dev/null}" ] && grep -c . "$KEYRING" || echo 0)"
+    cat <<EOF
+
+  ${C_B}wifiscope${C_RESET}  pcap:${C_CYN}${PCAP##*/}${C_RESET}  target:${C_B}${SSID:-<none>}${C_RESET}  decrypt:$([ ${#DEC[@]} -gt 0 ] && printf "%son%s" "$C_GRN" "$C_RESET" || printf "%soff%s" "$C_DIM" "$C_RESET")  keys:${C_MAG}${kn}${C_RESET}
+  ${C_DIM}──────────────────────────────────────────────────────────${C_RESET}
+   ${C_CYN}ANALYZE${C_RESET}  1 recon   2 bands   3 crypto   4 hardware
+            5 clients 6 keys    7 topology 8 hosts
+            9 probes  0 handshakes
+   ${C_CYN}CRACK${C_RESET}    p pmkid   x export22000  ${C_DIM}(hashcat -m 22000)${C_RESET}
+   ${C_CYN}KEYS${C_RESET}     k passphrase  h harvest  g scrapegtk
+            a addkey  i import  K show  d delkey  c clearkey
+   ${C_CYN}SESSION${C_RESET}  s select-ssid  r report  q quit
+  ${C_DIM}──────────────────────────────────────────────────────────${C_RESET}
+EOF
+    # `|| break` exits cleanly on end-of-input instead of spinning on empty reads.
+    printf "${C_B}wifiscope›${C_RESET} "; read -r c || break
+    case "$c" in
+      1|recon)      recon | paint ;;
+      2|bands)      bands | paint ;;
+      3|crypto)     crypto | paint ;;
+      4|hardware)   hardware | paint ;;
+      5|clients)    clients | paint ;;
+      6|keys)       keys | paint ;;
+      7|topology)   topology | paint ;;
+      8|hosts)      hosts | paint ;;
+      9|probes)     probes | paint ;;
+      0|handshakes) handshakes | paint ;;
+      p|pmkid)      pmkid | paint ;;
+      x|export*)    printf 'output file [%s]: ' "${PCAP%.*}.hc22000"; read -e -r f; export22000 "${f:-}" ;;
+      h|harvest)    harvest ;;
+      g|scrapegtk)  scrapegtk ;;
+      s)            pick_ssid ;;
+      k)            set_key ;;
+      a|addkey)     addkey ;;
+      i|import)     printf 'key file to import: '; read -e -r f; import "${f:-}" ;;
+      K|keyring)    keyring ;;
+      d|delkey)     delkey ;;
+      c|clearkey)   clearkey ;;
+      r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; report "${f:-}" ;;
+      q|quit)       break ;;
+      *)            note "unknown choice: $c" ;;
+    esac
+  done
+}
+
+# main: decide between one-shot (first arg is a command) and interactive.
+main() {
+  need "$TSHARK"
+
+  # One-shot forms that take their own args (not ssid/passphrase):
+  case "${1:-}" in
+    addkey)   shift; [ -n "${1:-}" ] || die "usage: wifiscope.sh addkey <pcap> <type> <value>"
+              load_pcap "$1"; addkey "${2:-}" "${3:-}"; return ;;
+    import)   shift; [ -n "${1:-}" ] || die "usage: wifiscope.sh import <pcap> <keyfile>"
+              load_pcap "$1"; import "${2:-}"; return ;;
+    delkey)   shift; [ -n "${1:-}" ] || die "usage: wifiscope.sh delkey <pcap> <value|all>"
+              load_pcap "$1"; delkey "${2:-}"; return ;;
+    clearkey) shift; [ -n "${1:-}" ] || die "usage: wifiscope.sh clearkey <pcap>"
+              load_pcap "$1"; clearkey; return ;;
+  esac
+
+  # One-shot form:  wifiscope.sh <command> <pcap> [ssid] [passphrase]
+  case "${1:-}" in
+    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keyring|pmkid|probes|handshakes|export22000)
+      local cmd="$1"; shift
+      [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
+      load_pcap "$1"
+      SSID="${2:-}"
+      [ -n "$SSID" ] && load_target_bssids
+      if [ -n "${3:-}" ] && [ -n "$SSID" ]; then
+        PASS="$3"; kr_add wpa-pwd "$PASS:$SSID"; rebuild_dec
+      fi
+      # bands/crypto/etc need an SSID; nudge if it's missing.
+      [ -z "$SSID" ] && [ "$cmd" != recon ] && note "no SSID given — pass one as arg 2 for scoped results"
+      # Paint the read-only display commands; run the rest (report/harvest/…) direct.
+      case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes " in
+        *" $cmd "*) "$cmd" | paint ;;
+        *)          "$cmd" ;;
+      esac
+      return
+      ;;
+  esac
+
+  # Interactive form: optional pcap as $1, else ask.
+  if [ -n "${1:-}" ]; then
+    load_pcap "$1"
+  else
+    # `read -e` turns on readline, giving filename TAB-completion + line editing.
+    printf 'pcap file: '; read -e -r p; load_pcap "$p"
+  fi
+  pick_ssid
+  set_key
+  menu
+}
+
+main "$@"
