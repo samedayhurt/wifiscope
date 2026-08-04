@@ -97,6 +97,19 @@ chmod +x wifiscope.sh
 | `keyring` / `delkey` / `clearkey` | Manage the keyring |
 | `report` | Everything → Markdown |
 
+### Environment
+
+| Variable | Effect |
+|---|---|
+| `TSHARK` | Path to the `tshark` binary if it isn't on `$PATH` |
+| `NO_COLOR` | Disable all color/emoji/links (also auto-off when output isn't a TTY) |
+| `WIFISCOPE_FORCE_COLOR=1` | Force color on even when piped (e.g. into `less -R`) |
+
+```bash
+TSHARK=/opt/wireshark/bin/tshark ./wifiscope.sh recon capture.pcapng
+NO_COLOR=1 ./wifiscope.sh crypto capture.pcapng HomeNet     # plain text
+```
+
 ## The keyring & decryption model
 
 Keys live in `<pcap>.keys` (one per capture) and rebuild `tshark`'s decryption args on every run:
