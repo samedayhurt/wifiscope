@@ -179,26 +179,56 @@ load_pcap() {
 # pick_ssid: list the SSIDs in the capture (with how many BSSIDs each spans) and
 #            let the user choose the target. This is the "single network" scope:
 #            you must see the names before you can focus on one.
+# resolve_hidden BSSID: recover a hidden AP's SSID from the frames that DO carry it —
+#   probe responses (subtype 5) and association requests (subtype 0) referencing that
+#   BSSID. Returns the most-seen name, or empty if the SSID was never disclosed.
+resolve_hidden() {
+  local b="$1"
+  "$TSHARK" -r "$PCAP" \
+    -Y "wlan.bssid==$b && (wlan.fc.type_subtype==5 || wlan.fc.type_subtype==0) && wlan.ssid != \"\"" \
+    -T fields -e wlan.ssid 2>/dev/null | tr -d '\r' | dessid 1 \
+    | grep -v '<MISSING>' | grep . | sort | uniq -c | sort -rn | sed 's/^ *[0-9]* *//' | head -1
+}
+
 pick_ssid() {
   section "networks in this capture"
   # Build a numbered list of unique, non-empty SSIDs.
   mapfile -t names < <(
     "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.ssid 2>/dev/null \
       | tr -d '\r' | dessid 1 | sort | uniq -c | sort -rn | sed 's/^ *//' \
-      | grep -v '^[0-9]* *$' | grep -v '<MISSING>'   # drop hidden / blank SSIDs from the picker
+      | grep -v '^[0-9]* *$' | grep -v '<MISSING>'   # named nets; hidden ones handled below
   )
-  local i=1
+  # Hidden APs beacon with a zero-length SSID; list them too (with any recovered
+  # name) so a hidden target can still be selected — it scopes by BSSID afterward.
+  mapfile -t hidden < <(
+    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8 && (wlan.ssid=="" || wlan.ssid=="<MISSING>")' \
+      -T fields -e wlan.bssid 2>/dev/null | tr -d '\r' | sort -u | grep .
+  )
+  local i=1 line b nm; local -a hnames=()
   for line in "${names[@]}"; do printf '  %2d) %s\n' "$i" "$line"; i=$((i+1)); done
+  for b in "${hidden[@]}"; do
+    nm="$(resolve_hidden "$b")"; hnames+=("$nm")
+    if [ -n "$nm" ]; then printf '  %2d) %s %s(hidden, %s)%s\n' "$i" "$nm" "$C_DIM" "$b" "$C_RESET"
+    else                 printf '  %2d) %s<hidden>%s  %s\n' "$i" "$C_DIM" "$C_RESET" "$b"; fi
+    i=$((i+1))
+  done
   printf 'select target SSID number (or type a name): '
   read -r choice || die "no input"
-  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ]; then
-    # Strip the leading "  <count> " to recover just the SSID text.
-    SSID="$(printf '%s\n' "${names[$((choice-1))]}" | sed 's/^[0-9]* *//')"
+  local nn="${#names[@]}" nh="${#hidden[@]}"
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$((nn+nh))" ]; then
+    if [ "$choice" -le "$nn" ]; then
+      SSID="$(printf '%s\n' "${names[$((choice-1))]}" | sed 's/^[0-9]* *//')"   # strip count
+      load_target_bssids
+    else
+      local hb="${hidden[$((choice-nn-1))]}"
+      SSID="${hnames[$((choice-nn-1))]:-$hb}"
+      TGT_BSSIDS=("$hb")                        # hidden: beacons carry no name, scope by BSSID
+      note "hidden network: scoping by BSSID $hb"
+    fi
   else
-    SSID="$choice"
+    SSID="$choice"; load_target_bssids
   fi
   [ -n "$SSID" ] || die "no SSID selected"
-  load_target_bssids
   note "target SSID: $SSID  (${#TGT_BSSIDS[@]} BSSIDs)"
 }
 
@@ -772,20 +802,36 @@ clearkey() { [ -n "$KEYRING" ] && : > "$KEYRING"; rebuild_dec; ok "keyring clear
 #   wired hosts, and the WAN/gateway. Full host labels (IP/host/OS/proto) need the
 #   keyring; without keys it still draws the L2 layer (APs + associations + backhaul).
 map() {
-  [ -n "$SSID" ] || { note "select an SSID first (s)"; return; }
-  local out="${1:-${SSID}.drawio}" wd; wd="$(mktemp -d)"
-  section "🗺️  drawing network map for $SSID"
+  local all="${MAP_ALL:-0}"
+  [ "$all" = 1 ] || [ -n "$SSID" ] || { note "select an SSID first (s), or use mapall"; return; }
+  local out="${1:-${SSID:-network}.drawio}" wd; wd="$(mktemp -d)"
+  # In whole-capture mode we scope to EVERY beaconing BSSID and every SSID; a single
+  # physical unit that radiates main/guest/IoT SSIDs then appears once, with all its
+  # SSIDs listed — that's the "entire network", not one ESSID at a time.
+  local bfilt afilt title
+  if [ "$all" = 1 ]; then
+    bfilt='wlan.fc.type_subtype==8'
+    afilt='(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2)'
+    title='whole capture'
+  else
+    bfilt="$(beacons_of_target)"
+    afilt="(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\""
+    title="$SSID"
+  fi
+  section "🗺️  drawing network map for $title"
   # --- collect data into TSV files the generator reads ---
-  ts  -Y "$(beacons_of_target)" -T fields -e wlan.bssid -e wlan.ds.current_channel \
-      -e wlan.ht.info.primarychannel -e radiotap.channel.freq 2>/dev/null | sort -u > "$wd/beacons.tsv"
-  ts  -Y "wps.model_name && $(bssid_filter)" -T fields -e wps.manufacturer -e wps.model_name 2>/dev/null \
-      | sort -u | head -1 > "$wd/wps.tsv"
+  # beacons carry a 5th column now: the (hex-decoded) SSID, so the generator can
+  # label each physical unit with the SSIDs it radiates.
+  ts  -Y "$bfilt" -T fields -e wlan.bssid -e wlan.ds.current_channel \
+      -e wlan.ht.info.primarychannel -e radiotap.channel.freq -e wlan.ssid 2>/dev/null \
+      | dessid 5 | sort -u > "$wd/beacons.tsv"
+  ts  -Y "wps.model_name && $(bssid_filter)" -T fields -e wlan.bssid -e wps.manufacturer -e wps.model_name 2>/dev/null \
+      | sort -u > "$wd/wps.tsv"
   # client<->AP association pairs, unioned across all discovery sources (assoc /
   # EAPOL / ToDS uplink / FromDS downlink) so the map shows clients that never
   # completed a captured handshake — see station_macs() for the rationale.
   {
-    ts -Y "(wlan.fc.type_subtype==0||wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
-       -T fields -e wlan.sa -e wlan.bssid 2>/dev/null
+    ts -Y "$afilt" -T fields -e wlan.sa -e wlan.bssid 2>/dev/null
     ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da -e wlan.bssid 2>/dev/null \
       | awk -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
           {sa=tolower($1); sta=(sa in AP)?$2:$1; if(sta!="")print sta"\t"$3}'
@@ -808,7 +854,11 @@ map() {
   tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name 2>/dev/null | sort -u > "$wd/names.tsv"
   { tsd -Y 'ip'   -T fields -e ip.src   -e _ws.col.protocol 2>/dev/null
     tsd -Y 'ipv6' -T fields -e ipv6.src -e _ws.col.protocol 2>/dev/null; } | sort -u > "$wd/proto.tsv"
-  printf '%s' "$SSID" > "$wd/ssid.txt"
+  # observed L3 conversations (v4+v6) — drawn as dashed edges between hosts that
+  # both appear on the map, i.e. real intra-LAN "who talks to whom".
+  { tsd -Y 'ip'   -T fields -e ip.src   -e ip.dst   2>/dev/null
+    tsd -Y 'ipv6' -T fields -e ipv6.src -e ipv6.dst 2>/dev/null; } | sort -u > "$wd/conv.tsv"
+  printf '%s' "$title" > "$wd/ssid.txt"
   # --- generate the .drawio (python; script in a var so stdin stays free) ---
   local GEN_PY; read -r -d '' GEN_PY <<'PY'
 import sys, os
@@ -836,7 +886,7 @@ def freq2chan(f, bnd):
     if bnd=='5G':   return str((f-5000)//5)
     if bnd=='6G':   return str((f-5950)//5)     # WiFi 6E/7: HT tag absent, derive from freq
     return ''
-band={}; chan={}
+band={}; chan={}; ssid_of=defaultdict(set)
 for r in rd('beacons.tsv'):
     b=r[0].lower(); f=0
     try: f=int(str(r[3]).split(',')[0])
@@ -849,7 +899,16 @@ for r in rd('beacons.tsv'):
     c=(r[2] if f>5000 else r[1]) if len(r)>2 else ''
     if not c or c=='0': c=freq2chan(f,bnd)
     chan[b]=c
-mk=' '.join(x for x in one('wps.tsv') if x).strip() or 'AP'
+    nm=(r[4] if len(r)>4 else '').strip()          # SSID this BSSID radiates
+    if nm and nm!='<MISSING>': ssid_of[b].add(nm)
+# make/model per BSSID (from WPS): "<mfr> <model>". Falls back to a single global
+# make when the capture only had one WPS record.
+wps_of={}
+for r in rd('wps.tsv'):
+    if not r: continue
+    bb=r[0].lower(); mm=' '.join(x for x in r[1:] if x).strip()
+    if bb and mm: wps_of[bb]=mm
+mk_default=(next(iter(wps_of.values())) if wps_of else 'AP')
 dhcp={}
 for r in rd('dhcp.tsv'):
     # tshark joins repeated field occurrences with commas (e.g. the mac appears
@@ -966,6 +1025,15 @@ EBH ='endArrow=none;dashed=1;strokeColor=#b85450;strokeWidth=2;html=1;fontSize=9
 ECL ='endArrow=none;strokeColor=#9673a6;html=1;fontSize=9;'
 EWI ='endArrow=none;strokeColor=#d79b00;strokeWidth=2;html=1;fontSize=9;'
 EWA ='endArrow=none;strokeColor=#666666;strokeWidth=2;html=1;'
+ip2cell={}                                        # ip -> host cell, for the L3 layer
+def unit_make(k):
+    for b in sorted(units[k]):
+        if b in wps_of: return wps_of[b]
+    return mk_default
+def unit_ssids(k):
+    s=set()
+    for b in units[k]: s|=ssid_of.get(b,set())
+    return sorted(s)
 ordered=([rootk]+[k for k in units if k!=rootk]) if rootk in units else list(units)
 uid={}; ux={}; x=80
 for k in ordered:
@@ -974,7 +1042,10 @@ for k in ordered:
     head=('ROOT / GATEWAY' if k==rootk else 'satellite')
     radios='  '.join('%s %s ch%s'%(':'.join(b.split(':')[3:]),band.get(b,'?'),chan.get(b,'?')) for b in bs[:2]) \
            or '(backhaul-only radio)'
-    uid[k]=cell('%s\n%s\n%s'%(head,mk,radios), x,200,250,90, AP_R if k==rootk else AP_S); ux[k]=x; x+=290
+    sl=unit_ssids(k)
+    ssline=('SSIDs: '+'  '.join(sl[:4])+(' +%d'%(len(sl)-4) if len(sl)>4 else '')) if sl else ''
+    body='\n'.join(p for p in (head, unit_make(k), ssline, radios) if p)
+    uid[k]=cell(body, x,190,250,104, AP_R if k==rootk else AP_S); ux[k]=x; x+=290
 if rootk in ux and gwip:
     w=cell('Internet / ISP\n(uplink %s)'%gwip, ux[rootk]+45,40,160,70, WAN); edge(w,uid[rootk],'',EWA)
 # Draw the OBSERVED backhaul topology from the 4-address frames (chain or star).
@@ -992,25 +1063,60 @@ for sta,(k,b) in sorted(cl_unit.items()):
     c=percol[k]; percol[k]+=1
     ip,host,vc,pr=enrich(sta)
     lbl='\n'.join(x for x in [host or '(client)', ip, sta, vc, ' '.join(pr)] if x)
-    ci=cell(lbl, ux[k], 350+c*100, 230, 86, CLI)
+    ci=cell(lbl, ux[k], 380+c*100, 230, 86, CLI)
+    if ip: ip2cell.setdefault(ip,ci)
     edge(uid[k],ci,'%s ch%s'%(band.get(b,''),chan.get(b,'')),ECL)
 wx=80
 for m in sorted(wired):
     ip,host,vc,pr=enrich(m)
     if not ip: continue
     lbl='\n'.join(x for x in [host or '(wired host)', ip, m, ' '.join(pr)] if x)
-    wi=cell(lbl, wx, 650, 230, 86, WIR)
+    wi=cell(lbl, wx, 690, 230, 86, WIR)
+    if ip: ip2cell.setdefault(ip,wi)
     if rootk in uid: edge(uid[rootk],wi,'wired',EWI)
     wx+=250
-cell('%s — network map  (AP units clustered best-effort)'%ssid, 80,150,520,24,'text;html=1;fontStyle=1;fontSize=13;')
+# --- L3 layer: observed intra-LAN conversations between hosts already on the map.
+# Only pairs where BOTH endpoints are drawn hosts get an edge — host<->gateway and
+# host<->Internet are intentionally skipped (the WAN uplink already shows egress),
+# leaving the real "who talks to whom" without clutter. Capped so a busy capture
+# can't produce thousands of edges.
+L3='endArrow=none;dashed=1;strokeColor=#666666;opacity=45;html=1;'
+seen_l3=set(); n_l3=0; L3_CAP=80
+for r in rd('conv.tsv'):
+    if len(r)<2 or not r[0] or not r[1] or r[0]==r[1]: continue
+    a,b=r[0],r[1]
+    if a in ip2cell and b in ip2cell:
+        kk=tuple(sorted((a,b)))
+        if kk in seen_l3: continue
+        seen_l3.add(kk)
+        if n_l3>=L3_CAP: continue
+        edge(ip2cell[a],ip2cell[b],'',L3); n_l3+=1
+if n_l3>=L3_CAP: sys.stderr.write('note: L3 edges capped at %d\n'%L3_CAP)
+cell('%s — network map  (physical AP units; backhaul + L3 from observed frames)'%ssid, 80,150,620,24,'text;html=1;fontStyle=1;fontSize=13;')
 xml='<mxfile><diagram name="%s"><mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" page="1" pageWidth="1600" pageHeight="1100"><root><mxCell id="0"/><mxCell id="1" parent="0"/>%s</root></mxGraphModel></diagram></mxfile>'%(esc(ssid or 'net'),''.join(cells))
 open(out,'w',encoding='utf-8').write(xml)
-print('units=%d backhaul_links=%d clients=%d wired=%d'%(len([k for k in units if k]),len(bh_edges),len(cl_unit),sum(1 for m in wired if anyip(m))))
+print('units=%d backhaul_links=%d clients=%d wired=%d l3_links=%d'%(len([k for k in units if k]),len(bh_edges),len(cl_unit),sum(1 for m in wired if anyip(m)),n_l3))
 PY
   local summary; summary="$("$PYBIN" -c "$GEN_PY" "$wd" "$out" 2>&1)"
   rm -rf "$wd"
   if [ -s "$out" ]; then ok "wrote $(hlink "file://$PWD/$out" "$out") ($summary) — open at app.diagrams.net"
   else note "map generation produced nothing"; fi
+}
+
+# mapall: map the WHOLE capture — every SSID and every physical AP unit at once.
+#   A real deployment usually radiates several SSIDs (main / guest / IoT) from the
+#   same hardware; mapping one ESSID at a time can't show that. This scopes the map
+#   to every beaconing BSSID, so each physical unit appears once with all the SSIDs
+#   it advertises. Decryption still needs the relevant keys in the keyring.
+mapall() {
+  [ "${#ALL_BSSIDS[@]}" -gt 0 ] || { note "no beaconing BSSIDs in this capture"; return; }
+  local out="${1:-network.drawio}"
+  # Widen the BSSID scope to the entire capture for the duration of the draw, then
+  # restore whatever single-SSID target the session had.
+  local _ssid="$SSID"; local -a _tgt=(); [ "${#TGT_BSSIDS[@]}" -gt 0 ] && _tgt=("${TGT_BSSIDS[@]}")
+  TGT_BSSIDS=("${ALL_BSSIDS[@]}")
+  MAP_ALL=1 map "$out"
+  SSID="$_ssid"; TGT_BSSIDS=(); [ "${#_tgt[@]}" -gt 0 ] && TGT_BSSIDS=("${_tgt[@]}")
 }
 
 # report: run every section into a markdown file. tshark's teaching lines go to
@@ -1058,7 +1164,7 @@ menu() {
    ${C_CYN}CRACK${C_RESET}    p pmkid   x export22000  ${C_DIM}(hashcat -m 22000)${C_RESET}
    ${C_CYN}KEYS${C_RESET}     k passphrase  h harvest  g scrapegtk
             a addkey  i import  K show  d delkey  c clearkey
-   ${C_CYN}SESSION${C_RESET}  s select-ssid  m map  r report  q quit
+   ${C_CYN}SESSION${C_RESET}  s select-ssid  m map  M mapall  r report  q quit
   ${C_DIM}──────────────────────────────────────────────────────────${C_RESET}
 EOF
     # `|| break` exits cleanly on end-of-input instead of spinning on empty reads.
@@ -1086,6 +1192,7 @@ EOF
       d|delkey)     delkey ;;
       c|clearkey)   clearkey ;;
       m|map)        printf 'drawio file [%s.drawio]: ' "${SSID:-net}"; read -e -r f; map "${f:-}" ;;
+      M|mapall)     printf 'drawio file [network.drawio]: '; read -e -r f; mapall "${f:-}" ;;
       r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; report "${f:-}" ;;
       q|quit)       break ;;
       *)            note "unknown choice: $c" ;;
@@ -1111,7 +1218,7 @@ main() {
 
   # One-shot form:  wifiscope.sh <command> <pcap> [ssid] [passphrase]
   case "${1:-}" in
-    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keyring|pmkid|probes|handshakes|export22000|map)
+    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keyring|pmkid|probes|handshakes|export22000|map|mapall)
       local cmd="$1"; shift
       [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
       load_pcap "$1"
@@ -1120,8 +1227,8 @@ main() {
       if [ -n "${3:-}" ] && [ -n "$SSID" ]; then
         PASS="$3"; kr_add wpa-pwd "$PASS:$SSID"; rebuild_dec
       fi
-      # bands/crypto/etc need an SSID; nudge if it's missing.
-      [ -z "$SSID" ] && [ "$cmd" != recon ] && note "no SSID given — pass one as arg 2 for scoped results"
+      # bands/crypto/etc need an SSID; nudge if it's missing (recon/mapall don't).
+      [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && note "no SSID given — pass one as arg 2 for scoped results"
       # Paint the read-only display commands; run the rest (report/harvest/…) direct.
       case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes " in
         *" $cmd "*) "$cmd" | paint ;;
