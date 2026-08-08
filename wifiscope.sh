@@ -695,7 +695,11 @@ topology() {
   printf '%s\n' "${TGT_BSSIDS[@]}"
   echo "count: ${#TGT_BSSIDS[@]}"
   section "802.11 WDS backhaul (4-address) links: transmitter -> receiver"
-  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra | sort -u
+  # Drop 4-address frames to a group-addressed receiver (multicast/broadcast) —
+  # a real backhaul peer is unicast; the I/G bit (2nd hex digit odd) flags a group.
+  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra \
+    | awk -F'\t' '$1!="" && $2!="" && tolower(substr($1,2,1)) !~ /[13579bdf]/ && tolower(substr($2,2,1)) !~ /[13579bdf]/' \
+    | sort -u
   section "backhaul frame count"
   ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' | wc -l
   note "count physical APs = distinct units in the backhaul (root + each satellite backhaul-STA)"
@@ -889,6 +893,9 @@ def esc(s): return (s or '').replace('&','&amp;').replace('<','&lt;').replace('>
 def ukey(b):
     o=b.lower().split(':')
     return b.lower() if len(o)!=6 else ':'.join(o[2:5])+':%02x'%(int(o[5],16)&0xFC)
+def is_group(m):                       # I/G bit set = broadcast/multicast, not a real peer
+    try: return int(m.split(':')[0],16)&1
+    except Exception: return True
 ssid=txt('ssid.txt'); gwip=txt('gw.txt')
 def freq2chan(f, bnd):
     if not f: return ''
@@ -918,7 +925,9 @@ for r in rd('wps.tsv'):
     if not r: continue
     bb=r[0].lower(); mm=' '.join(x for x in r[1:] if x).strip()
     if bb and mm: wps_of[bb]=mm
-mk_default=(next(iter(wps_of.values())) if wps_of else 'AP')
+# Only ever attribute a make to a unit whose OWN BSSID advertised it (unit_make);
+# a generic 'AP' otherwise. Never brand every unit with one stray neighbor's WPS.
+mk_default='AP'
 dhcp={}
 for r in rd('dhcp.tsv'):
     # tshark joins repeated field occurrences with commas (e.g. the mac appears
@@ -970,7 +979,9 @@ for b in apb: units[ukey(b)].add(b)
 # of a synthesized root→everything star.
 bh_pairs=[]
 for r in rd('backhaul.tsv'):
-    if len(r)>=2 and r[0] and r[1] and r[0]!='ff:ff:ff:ff:ff:ff' and r[1]!='ff:ff:ff:ff:ff:ff':
+    # A real WDS backhaul link is unicast<->unicast; a 4-address frame to a
+    # group-addressed RA (e.g. 01:0b:85:.. multicast) is not an AP-to-AP peer.
+    if len(r)>=2 and r[0] and r[1] and not is_group(r[0]) and not is_group(r[1]):
         bh_pairs.append((r[0].lower(), r[1].lower()))
 # Associate each backhaul RADIO mac with a fronthaul unit by its octets 3-5 (the
 # stable NIC base ukey() already clusters on) — a box's backhaul radio and its
