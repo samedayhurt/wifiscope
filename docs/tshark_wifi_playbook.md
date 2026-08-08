@@ -38,7 +38,9 @@ tshark -r "$PCAP" -N m -Y 'ip' -T fields -e eth.src -e eth.src_resolved -e ip.sr
 ## Band / channel
 
 2.4 GHz = freq 24xx / DSSS channel 1-14 (`wlan.ds.current_channel`).
-5 GHz = freq 5xxx / HT primary channel (`wlan.ht.info.primarychannel`).
+5 GHz = freq 5150-5895 / HT primary channel (`wlan.ht.info.primarychannel`).
+6 GHz = freq 5925-7125 (WiFi 6E/7) — emits neither the DSSS nor HT tag, so derive the channel
+from the radiotap frequency: `ch = (freq-5950)/5` (2.4: `(freq-2407)/5`, ch14=2484; 5: `(freq-5000)/5`).
 
 ```bash
 tshark -r "$PCAP" -Y 'wlan.fc.type_subtype==8 && wlan.bssid==BSSID' \
@@ -47,7 +49,13 @@ tshark -r "$PCAP" -Y 'wlan.fc.type_subtype==8 && wlan.bssid==BSSID' \
 
 ## Encryption (RSN / AKM)
 
-AKM type 2 = PSK (WPA2), 8 = SAE (WPA3), both + MFP = transition.
+Read the whole AKM suite set, not just 2/8 — an Enterprise net has neither and must not be
+misread as open. AKM suite types (OUI 00-0F-AC): 1 = 802.1X/EAP (Enterprise), 2 = PSK (WPA2),
+3 = FT-802.1X, 4 = FT-PSK, 5 = 802.1X-SHA256, 6 = PSK-SHA256, 8 = SAE (WPA3), 9 = FT-SAE,
+11/12 = 802.1X Suite-B (→ WPA3-Enterprise), 13 = FT-802.1X-SHA384, 14-17 = FILS, 18 = OWE
+(Enhanced Open), 19/20 = PSK-SHA384. SAE+PSK together (usually with MFP) = WPA2/WPA3 transition.
+No RSN AKM → check `wlan.wfa.ie.wpa.version` (WPA1) then `wlan.fixed.capabilities.privacy`
+(set = WEP, unset = open).
 
 ```bash
 tshark -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields \
@@ -86,6 +94,40 @@ tshark -r "$PCAP" -Y 'eapol' -T fields -e wlan.sa -e wlan.da \
 # confirm via decrypted L2 (a device seen here but never in a handshake = wired)
 tshark -r "$PCAP" "${DEC[@]}" -Y 'wlan.fc.type==2 && (ip||arp)' \
   -T fields -e wlan.sa -e wlan.da | tr '\t' '\n' | sort -u
+```
+
+Complete station discovery = the UNION of all four signals (a client already associated before the
+capture has no handshake, but its data frames are everywhere). Strip group-addressed MACs (2nd hex
+digit odd) and known BSSIDs afterward:
+
+```bash
+{ tshark -r "$PCAP" -Y '(wlan.fc.type_subtype==0||wlan.fc.type_subtype==2) && wlan.ssid=="SSID"' -T fields -e wlan.sa
+  tshark -r "$PCAP" -Y 'eapol && wlan.bssid==BSSID' -T fields -e wlan.sa -e wlan.da | tr '\t' '\n'
+  tshark -r "$PCAP" -Y 'wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && wlan.bssid==BSSID' -T fields -e wlan.sa
+  tshark -r "$PCAP" -Y 'wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && wlan.bssid==BSSID' -T fields -e wlan.da
+} | tr '\t' '\n' | sort -u | grep .
+```
+
+## Hidden SSIDs
+
+Hidden APs beacon with a zero-length SSID; recover the name from frames that carry it:
+
+```bash
+tshark -r "$PCAP" -Y 'wlan.bssid==BSSID && (wlan.fc.type_subtype==5||wlan.fc.type_subtype==0) && wlan.ssid!=""' \
+  -T fields -e wlan.ssid | sort -u
+```
+
+## IPv6 hosts
+
+ARP is IPv4-only; IPv6 hosts appear via ICMPv6 neighbor discovery and DHCPv6:
+
+```bash
+# IPv6 <-> MAC from the ND link-layer option (NS/NA/RS/RA)
+tshark -r "$PCAP" "${DEC[@]}" -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields \
+  -e ipv6.src -e icmpv6.opt.linkaddr -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u
+
+# DHCPv6 client MAC (DUID-LL)
+tshark -r "$PCAP" "${DEC[@]}" -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll.link_layer_addr | sort -u
 ```
 
 ## Keys

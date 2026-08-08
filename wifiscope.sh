@@ -24,6 +24,8 @@
 set -uo pipefail
 
 # ---- globals ----------------------------------------------------------------
+VERSION="1.1.0"
+
 # Override the tshark path if it isn't on $PATH:  TSHARK=/opt/wireshark/bin/tshark ./wifiscope.sh
 TSHARK="${TSHARK:-tshark}"
 
@@ -543,6 +545,35 @@ bands() {
 #         18  OWE                    19  FT-PSK-SHA384    20  PSK-SHA384
 #        When no RSN AKM is present we fall back to the WPA1 vendor IE, then the
 #        Privacy capability bit to tell WEP (1) from truly open (0).
+
+# classify_akm: pure verdict engine — reads the set of AKM suite numbers (one per
+#   line on stdin) plus two flags, privacy-bit-seen ($1) and wpa1-IE-seen ($2), and
+#   prints "class<TAB>verdict". class ∈ strong|trans|ent|weak|open picks the colour.
+#   No tshark, no globals — so the classification is unit-testable on its own.
+classify_akm() {
+  awk -v priv="${1:-}" -v wpa1="${2:-}" '
+    { t=$1+0
+      if      (t==8||t==9)                          sae=1
+      else if (t==2||t==4||t==6||t==19||t==20)      psk=1
+      else if (t==1||t==3||t==5)                    eap=1
+      else if (t==11||t==12||t==13)               { eap=1; sb=1 }   # Suite-B/SHA384
+      else if (t>=14&&t<=17)                        eap=1          # FILS
+      else if (t==18)                               owe=1 }
+    END{
+      if      (sae&&psk) print "trans\tWPA2/WPA3-Personal transition (PSK + SAE)"
+      else if (sae&&eap) print "ent\tWPA3-Enterprise + SAE"
+      else if (sae)      print "strong\tWPA3-Personal (SAE)"
+      else if (owe)      print "strong\tWPA3-OWE (Enhanced Open)"
+      else if (eap&&sb)  print "ent\tWPA3-Enterprise (802.1X Suite-B)"
+      else if (eap&&psk) print "trans\tmixed Enterprise + PSK"
+      else if (eap)      print "ent\tWPA2/WPA3-Enterprise (802.1X/EAP)"
+      else if (psk)      print "weak\tWPA2-Personal (PSK)"
+      else if (wpa1!="") print "weak\tWPA1 (legacy TKIP, vendor IE)"
+      else if (priv!="") print "weak\tWEP / legacy (Privacy bit set, no RSN)"
+      else               print "open\topen (no encryption)"
+    }'
+}
+
 crypto() {
   section "🔐 encryption for $SSID"
   ts -Y "$(beacons_of_target)" -T fields \
@@ -552,42 +583,19 @@ crypto() {
   local akms
   akms="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.rsn.akms.type 2>/dev/null \
           | tr ',' '\n' | tr -d ' ' | sort -u | grep .)"
-  # Privacy capability bit — distinguishes open (unset) from WEP/legacy (set) when
-  # no RSN element is present at all.
-  local priv
+  # Privacy bit (open vs WEP when no RSN) and WPA1 vendor IE (legacy, but not open).
+  local priv wpa1
   priv="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.fixed.capabilities.privacy 2>/dev/null \
           | tr -d ' ' | sort -u | grep -m1 1)"
-  # WPA1 = the pre-RSN Microsoft/WFA vendor IE (no RSN AKM, but not open either).
-  local wpa1
   wpa1="$(ts -Y "$(beacons_of_target) && wlan.wfa.ie.wpa.version" -T fields -e wlan.bssid 2>/dev/null | grep -m1 .)"
-
-  # Bucket the AKM set: SAE=WPA3-Personal, PSK=WPA2-Personal, EAP=Enterprise,
-  # OWE=Enhanced Open, Suite-B=WPA3-Enterprise.
-  local has_sae=0 has_psk=0 has_eap=0 has_owe=0 has_sb=0 t
-  while read -r t; do
-    case "$t" in
-      8|9)          has_sae=1 ;;
-      2|4|6|19|20)  has_psk=1 ;;
-      1|3|5)        has_eap=1 ;;
-      11|12|13)     has_eap=1; has_sb=1 ;;   # Suite-B / SHA384 → WPA3-Enterprise
-      14|15|16|17)  has_eap=1 ;;             # FILS (enterprise key mgmt)
-      18)           has_owe=1 ;;
-    esac
-  done <<< "$akms"
-
-  local v
-  if   [ $has_sae = 1 ] && [ $has_psk = 1 ]; then v="${C_YEL}WPA2/WPA3-Personal transition (PSK + SAE)${C_RESET}"
-  elif [ $has_sae = 1 ] && [ $has_eap = 1 ]; then v="${C_MAG}WPA3-Enterprise + SAE${C_RESET}"
-  elif [ $has_sae = 1 ];                     then v="${C_GRN}WPA3-Personal (SAE)${C_RESET}"
-  elif [ $has_owe = 1 ];                     then v="${C_GRN}WPA3-OWE (Enhanced Open)${C_RESET}"
-  elif [ $has_eap = 1 ] && [ $has_sb = 1 ];  then v="${C_MAG}WPA3-Enterprise (802.1X Suite-B)${C_RESET}"
-  elif [ $has_eap = 1 ] && [ $has_psk = 1 ]; then v="${C_YEL}mixed Enterprise + PSK${C_RESET}"
-  elif [ $has_eap = 1 ];                     then v="${C_MAG}WPA2/WPA3-Enterprise (802.1X/EAP)${C_RESET}"
-  elif [ $has_psk = 1 ];                     then v="${C_YEL}WPA2-Personal (PSK)${C_RESET}"
-  elif [ -n "$wpa1" ];                       then v="${C_RED}WPA1 (legacy TKIP, vendor IE)${C_RESET}"
-  elif [ -n "$priv" ];                       then v="${C_RED}WEP / legacy (Privacy bit set, no RSN)${C_RESET}"
-  else                                            v="${C_RED}open (no encryption)${C_RESET}"; fi
-  printf '%s🔒 verdict:%s %s\n' "$C_B" "$C_RESET" "$v"
+  local cls txt
+  IFS=$'\t' read -r cls txt < <(printf '%s\n' "$akms" | classify_akm "$priv" "$wpa1")
+  local col
+  case "$cls" in
+    strong) col="$C_GRN" ;; trans) col="$C_YEL" ;; ent) col="$C_MAG" ;;
+    weak|open) col="$C_RED" ;; *) col="$C_B" ;;
+  esac
+  printf '%s🔒 verdict:%s %s%s%s\n' "$C_B" "$C_RESET" "$col" "$txt" "$C_RESET"
 }
 
 # hardware: pull make/model out of the WPS information element in beacons.
@@ -719,8 +727,10 @@ hosts() {
   section "DHCPv6 (client IPv6 / DUID link-layer MAC)"
   tsd -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll.link_layer_addr | sort -u
   section "hostname sweep (DHCP / NBNS / mDNS / LLMNR)"
+  # dns.resp.name (answers) carries the real host.local a device advertises; qry.name
+  # is what a device is *looking for*. Include both — the map keys names off resp.name.
   tsd -Y 'dhcp.option.hostname || nbns || mdns || llmnr' -T fields \
-      -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.qry.name | sort -u
+      -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u
   section "software versions (HTTP / SSH banners)"
   tsd -Y 'http.user_agent || http.server || ssh.protocol' -T fields \
       -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u
@@ -1143,6 +1153,40 @@ report() {
 }
 
 # =============================================================================
+#  SELFTEST  — exercises the pure-logic pieces (no pcap, no tshark needed) so the
+#  correctness-critical classification can be regression-checked anywhere. The
+#  end-to-end pipeline test that builds a synthetic capture lives in tests/.
+# =============================================================================
+selftest() {
+  local fail=0 got exp
+  section "🧪 wifiscope $VERSION selftest (pure logic, no pcap needed)"
+  check_akm() {                         # <akms space-sep> <priv> <wpa1> <want-substr>
+    local a="$1" p="$2" w="$3" want="$4" out
+    out="$(printf '%s\n' $a | classify_akm "$p" "$w" | cut -f2)"
+    if [[ "$out" == *"$want"* ]]; then ok "akm{$a}${p:+ priv}${w:+ wpa1} -> $out"
+    else note "FAIL akm{$a}: got '$out', want '*$want*'"; fail=1; fi
+  }
+  check_akm "2"   "" ""    "WPA2-Personal (PSK)"
+  check_akm "2 8" "" ""    "transition"
+  check_akm "8"   "" ""    "WPA3-Personal (SAE)"
+  check_akm "1"   "" ""    "Enterprise (802.1X/EAP)"     # regression: was "open/WEP?"
+  check_akm "5 1" "" ""    "Enterprise (802.1X/EAP)"
+  check_akm "12"  "" ""    "Suite-B"
+  check_akm "18"  "" ""    "OWE"
+  check_akm "6"   "" ""    "WPA2-Personal (PSK)"
+  check_akm ""    "1" ""   "WEP"
+  check_akm ""    "" "yes" "WPA1"
+  check_akm ""    "" ""    "open"
+
+  got="$(printf 'de:ad:be:ef:00:01\nff:ff:ff:ff:ff:ff\n01:00:5e:00:00:fb\n33:33:00:00:00:01\naa:bb:cc:dd:ee:00\n' \
+         | drop_group | tr '\n' ',')"
+  exp="de:ad:be:ef:00:01,aa:bb:cc:dd:ee:00,"
+  [ "$got" = "$exp" ] && ok "drop_group keeps only unicast" || { note "FAIL drop_group: $got"; fail=1; }
+
+  [ $fail = 0 ] && ok "all selftests passed" || die "selftests FAILED"
+}
+
+# =============================================================================
 #  DRIVER
 # =============================================================================
 
@@ -1202,6 +1246,17 @@ EOF
 
 # main: decide between one-shot (first arg is a command) and interactive.
 main() {
+  # Meta commands that need neither tshark nor a pcap.
+  case "${1:-}" in
+    -V|--version|version) printf 'wifiscope %s\n' "$VERSION"; return ;;
+    -h|--help|help)       banner; printf 'usage: wifiscope.sh [command] [pcap] [ssid] [passphrase]\n'
+                          printf 'commands: recon bands crypto hardware clients keys topology hosts\n'
+                          printf '          probes handshakes pmkid export22000 map mapall report\n'
+                          printf '          harvest scrapegtk keyring addkey import delkey clearkey\n'
+                          printf '          selftest version   (run with no args for the interactive menu)\n'; return ;;
+    selftest)             selftest; return ;;
+  esac
+
   need "$TSHARK"
 
   # One-shot forms that take their own args (not ssid/passphrase):
@@ -1230,9 +1285,10 @@ main() {
       # bands/crypto/etc need an SSID; nudge if it's missing (recon/mapall don't).
       [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && note "no SSID given — pass one as arg 2 for scoped results"
       # Paint the read-only display commands; run the rest (report/harvest/…) direct.
+      # mapall takes no SSID, so its arg-2 (if any) is the output .drawio filename.
       case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes " in
         *" $cmd "*) "$cmd" | paint ;;
-        *)          "$cmd" ;;
+        *) if [ "$cmd" = mapall ]; then mapall "${2:-}"; else "$cmd"; fi ;;
       esac
       return
       ;;
