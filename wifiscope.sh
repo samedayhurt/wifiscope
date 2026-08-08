@@ -473,38 +473,90 @@ recon() {
 }
 
 # bands: channel + band for each BSSID of the target SSID.
-#   WHY: 2.4GHz carries channel in the DSSS tag (wlan.ds.current_channel),
-#        5GHz carries it in the HT tag (wlan.ht.info.primarychannel). Radiotap
-#        frequency (>5000 MHz = 5GHz) is the tie-breaker.
+#   WHY: 2.4GHz carries channel in the DSSS tag (wlan.ds.current_channel), 5GHz in
+#        the HT tag (wlan.ht.info.primarychannel). 6GHz (WiFi 6E/7) emits neither —
+#        it uses the HE Operation element — so we derive the channel straight from
+#        the radiotap frequency when the band-specific tag is blank. Band comes from
+#        frequency: 2400s=2.4GHz, 5150-5895=5GHz, 5925-7125=6GHz.
 bands() {
   section "📶 bands / channels for $SSID"
   ts -Y "$(beacons_of_target)" -T fields \
      -e wlan.bssid -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \
      -e radiotap.channel.freq \
     | sort -u \
-    | awk '{band=($4>5000)?"5GHz":"2.4GHz"; printf "%-20s ch%-4s %s (%s MHz)\n",$1,($4>5000?$3:$2),band,$4}'
+    | awk 'BEGIN{FS=OFS="\t"}
+        {
+          split($4,ff,","); freq=ff[1]+0
+          if      (freq>=5925) band="6GHz"
+          else if (freq>=5150) band="5GHz"
+          else if (freq>0)     band="2.4GHz"
+          else                 band="?"
+          ch=(freq>5000)?$3:$2                       # band-specific beacon tag
+          if (ch=="" || ch=="0") {                   # derive from frequency
+            if      (band=="2.4GHz") ch=(freq==2484)?14:int((freq-2407)/5)
+            else if (band=="5GHz")   ch=int((freq-5000)/5)
+            else if (band=="6GHz")   ch=int((freq-5950)/5)
+          }
+          printf "%-20s ch%-4s %-6s (%s MHz)\n",$1,ch,band,ff[1]
+        }'
 }
 
 # crypto: read the RSN element and translate AKM suites into a plain verdict.
-#   WHY: AKM 2 = PSK (WPA2), 8 = SAE (WPA3). Both present (usually with MFP) =
-#        WPA2/WPA3 transition. None = open/WEP.
+#   WHY: the AKM suite type (00-0F-AC:<n>) names the auth+key-mgmt method. Reading
+#        only types 2 (PSK) and 8 (SAE) mislabels everything else — most damagingly,
+#        an 802.1X/EAP (Enterprise) network has no PSK/SAE AKM and used to fall
+#        through to "open/WEP?". The full suite table (IEEE 802.11-2020 Table 9-151):
+#          1  802.1X (EAP)            2  PSK               3  FT-802.1X
+#          4  FT-PSK                  5  802.1X-SHA256     6  PSK-SHA256
+#          8  SAE                     9  FT-SAE           11  802.1X Suite-B
+#         12  802.1X Suite-B-384     13  FT-802.1X-SHA384 14-17 FILS
+#         18  OWE                    19  FT-PSK-SHA384    20  PSK-SHA384
+#        When no RSN AKM is present we fall back to the WPA1 vendor IE, then the
+#        Privacy capability bit to tell WEP (1) from truly open (0).
 crypto() {
   section "🔐 encryption for $SSID"
   ts -Y "$(beacons_of_target)" -T fields \
      -e wlan.bssid -e wlan.rsn.akms.type \
      -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr | sort -u
-  # Collapse all AKM types seen across the target's beacons into one verdict.
+  # Collapse all AKM suite numbers seen across the target's beacons into one verdict.
   local akms
   akms="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.rsn.akms.type 2>/dev/null \
           | tr ',' '\n' | tr -d ' ' | sort -u | grep .)"
-  local has2=0 has8=0
-  grep -qx 2 <<<"$akms" && has2=1
-  grep -qx 8 <<<"$akms" && has8=1
+  # Privacy capability bit — distinguishes open (unset) from WEP/legacy (set) when
+  # no RSN element is present at all.
+  local priv
+  priv="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.fixed.capabilities.privacy 2>/dev/null \
+          | tr -d ' ' | sort -u | grep -m1 1)"
+  # WPA1 = the pre-RSN Microsoft/WFA vendor IE (no RSN AKM, but not open either).
+  local wpa1
+  wpa1="$(ts -Y "$(beacons_of_target) && wlan.wfa.ie.wpa.version" -T fields -e wlan.bssid 2>/dev/null | grep -m1 .)"
+
+  # Bucket the AKM set: SAE=WPA3-Personal, PSK=WPA2-Personal, EAP=Enterprise,
+  # OWE=Enhanced Open, Suite-B=WPA3-Enterprise.
+  local has_sae=0 has_psk=0 has_eap=0 has_owe=0 has_sb=0 t
+  while read -r t; do
+    case "$t" in
+      8|9)          has_sae=1 ;;
+      2|4|6|19|20)  has_psk=1 ;;
+      1|3|5)        has_eap=1 ;;
+      11|12|13)     has_eap=1; has_sb=1 ;;   # Suite-B / SHA384 → WPA3-Enterprise
+      14|15|16|17)  has_eap=1 ;;             # FILS (enterprise key mgmt)
+      18)           has_owe=1 ;;
+    esac
+  done <<< "$akms"
+
   local v
-  if   [ $has2 = 1 ] && [ $has8 = 1 ]; then v="${C_YEL}WPA2/WPA3 transition (PSK + SAE)${C_RESET}"
-  elif [ $has8 = 1 ];                  then v="${C_GRN}WPA3 (SAE)${C_RESET}"
-  elif [ $has2 = 1 ];                  then v="${C_YEL}WPA2 (PSK)${C_RESET}"
-  else v="${C_RED}no RSN AKM found (open/WEP?)${C_RESET}"; fi
+  if   [ $has_sae = 1 ] && [ $has_psk = 1 ]; then v="${C_YEL}WPA2/WPA3-Personal transition (PSK + SAE)${C_RESET}"
+  elif [ $has_sae = 1 ] && [ $has_eap = 1 ]; then v="${C_MAG}WPA3-Enterprise + SAE${C_RESET}"
+  elif [ $has_sae = 1 ];                     then v="${C_GRN}WPA3-Personal (SAE)${C_RESET}"
+  elif [ $has_owe = 1 ];                     then v="${C_GRN}WPA3-OWE (Enhanced Open)${C_RESET}"
+  elif [ $has_eap = 1 ] && [ $has_sb = 1 ];  then v="${C_MAG}WPA3-Enterprise (802.1X Suite-B)${C_RESET}"
+  elif [ $has_eap = 1 ] && [ $has_psk = 1 ]; then v="${C_YEL}mixed Enterprise + PSK${C_RESET}"
+  elif [ $has_eap = 1 ];                     then v="${C_MAG}WPA2/WPA3-Enterprise (802.1X/EAP)${C_RESET}"
+  elif [ $has_psk = 1 ];                     then v="${C_YEL}WPA2-Personal (PSK)${C_RESET}"
+  elif [ -n "$wpa1" ];                       then v="${C_RED}WPA1 (legacy TKIP, vendor IE)${C_RESET}"
+  elif [ -n "$priv" ];                       then v="${C_RED}WEP / legacy (Privacy bit set, no RSN)${C_RESET}"
+  else                                            v="${C_RED}open (no encryption)${C_RESET}"; fi
   printf '%s🔒 verdict:%s %s\n' "$C_B" "$C_RESET" "$v"
 }
 
@@ -719,13 +771,25 @@ def ukey(b):
     o=b.lower().split(':')
     return b.lower() if len(o)!=6 else ':'.join(o[2:5])+':%02x'%(int(o[5],16)&0xFC)
 ssid=txt('ssid.txt'); gwip=txt('gw.txt')
+def freq2chan(f, bnd):
+    if not f: return ''
+    if bnd=='2.4G': return '14' if f==2484 else str((f-2407)//5)
+    if bnd=='5G':   return str((f-5000)//5)
+    if bnd=='6G':   return str((f-5950)//5)     # WiFi 6E/7: HT tag absent, derive from freq
+    return ''
 band={}; chan={}
 for r in rd('beacons.tsv'):
     b=r[0].lower(); f=0
-    try: f=int(r[3])
+    try: f=int(str(r[3]).split(',')[0])
     except: pass
-    band[b]='5G' if f>5000 else '2.4G'
-    chan[b]=(r[2] if f>5000 else r[1]) if len(r)>2 else ''
+    if   f>=5925: bnd='6G'
+    elif f>=5150: bnd='5G'
+    elif f>0:     bnd='2.4G'
+    else:         bnd='?'
+    band[b]=bnd
+    c=(r[2] if f>5000 else r[1]) if len(r)>2 else ''
+    if not c or c=='0': c=freq2chan(f,bnd)
+    chan[b]=c
 mk=' '.join(x for x in one('wps.tsv') if x).strip() or 'AP'
 dhcp={}
 for r in rd('dhcp.tsv'):
@@ -763,12 +827,47 @@ for r in rd('clients.tsv'):
 apb=set(band)
 units=defaultdict(set)
 for b in apb: units[ukey(b)].add(b)
+# --- WDS 4-address backhaul: the ground truth for physical topology ----------
+# Each row is a transmitter/receiver pair of backhaul RADIO macs. We (a) fold each
+# backhaul radio into a physical unit (keyed like the fronthaul BSSIDs, so a
+# satellite whose backhaul radio shares its NIC-portion collapses into one unit,
+# and a satellite we never heard beacon still becomes a node), and (b) keep the
+# real inter-unit links so the map draws the OBSERVED mesh (chain or star) instead
+# of a synthesized root→everything star.
+bh_pairs=[]
+for r in rd('backhaul.tsv'):
+    if len(r)>=2 and r[0] and r[1] and r[0]!='ff:ff:ff:ff:ff:ff' and r[1]!='ff:ff:ff:ff:ff:ff':
+        bh_pairs.append((r[0].lower(), r[1].lower()))
+# Associate each backhaul RADIO mac with a fronthaul unit by its octets 3-5 (the
+# stable NIC base ukey() already clusters on) — a box's backhaul radio and its
+# fronthaul BSSIDs almost always share that base. A radio that matches no beaconing
+# unit is a satellite we only ever saw on backhaul, so it becomes its own node.
+def near(m): return ':'.join(m.split(':')[2:5])
+near2unit={}
+for k in list(units):
+    for b in units[k]: near2unit.setdefault(near(b), k)
+def bh_unit(m):
+    u=near2unit.get(near(m))
+    if u is None:
+        u=ukey(m); _=units[u]; near2unit[near(m)]=u
+    return u
+bh_macs=set()
+for ta,ra in bh_pairs: bh_macs.add(ta); bh_macs.add(ra)
+bh_edges=set()
+for ta,ra in bh_pairs:
+    ka,kb=bh_unit(ta),bh_unit(ra)
+    if ka!=kb: bh_edges.add(tuple(sorted((ka,kb))))
 gwmac=ip2mac.get(gwip,'')
-rootk=ukey(gwmac) if gwmac else None
-if rootk not in units and gwmac:
+rootk=ukey(gwmac) if (gwmac and ukey(gwmac) in units) else None
+if rootk is None and gwmac:
     g4=gwmac.split(':')[2:]
     for k in units:
         if any(x.split(':')[2:]== g4 or x.split(':')[3:]==gwmac.split(':')[3:] for x in units[k]): rootk=k; break
+# No gateway match? The root of a mesh is the node with the most backhaul links.
+if rootk is None and bh_edges:
+    deg=defaultdict(int)
+    for a,b in bh_edges: deg[a]+=1; deg[b]+=1
+    rootk=max(deg,key=deg.get)
 if rootk not in units:
     rootk=max(units,key=lambda k:sum(1 for s in cli for b in cli[s] if b in units[k])) if units else None
 def enrich(mac):
@@ -780,7 +879,7 @@ cl_unit={}
 for sta,bs in cli.items():
     k=next((ukey(b) for b in bs if b in apb), ukey(sorted(bs)[0]))
     cl_unit[sta]=(k, sorted(bs)[0])
-known=set(apb)|set(cli)|{b for k in units for b in units[k]}
+known=set(apb)|set(cli)|{b for k in units for b in units[k]}|bh_macs
 # wired = decrypted L2 devices that aren't clients or APs — but NOT the gateway
 # (its MAC/IP is the router itself, drawn as the WAN uplink, not a host).
 wired=[m for m,ip in mac2ip.items() if m not in known and m!=gwmac and ip!=gwip]
@@ -808,12 +907,20 @@ for k in ordered:
     if k is None: continue
     bs=sorted(units[k])
     head=('ROOT / GATEWAY' if k==rootk else 'satellite')
-    radios='  '.join('%s %s ch%s'%(':'.join(b.split(':')[3:]),band.get(b,'?'),chan.get(b,'?')) for b in bs[:2])
+    radios='  '.join('%s %s ch%s'%(':'.join(b.split(':')[3:]),band.get(b,'?'),chan.get(b,'?')) for b in bs[:2]) \
+           or '(backhaul-only radio)'
     uid[k]=cell('%s\n%s\n%s'%(head,mk,radios), x,200,250,90, AP_R if k==rootk else AP_S); ux[k]=x; x+=290
 if rootk in ux and gwip:
     w=cell('Internet / ISP\n(uplink %s)'%gwip, ux[rootk]+45,40,160,70, WAN); edge(w,uid[rootk],'',EWA)
-for k in ordered:
-    if k in uid and rootk in uid and k!=rootk: edge(uid[rootk],uid[k],'WDS backhaul',EBH)
+# Draw the OBSERVED backhaul topology from the 4-address frames (chain or star).
+drawn_bh=False
+for a,b in sorted(bh_edges):
+    if a in uid and b in uid: edge(uid[a],uid[b],'WDS backhaul',EBH); drawn_bh=True
+# Only fall back to a root→satellite star when NO backhaul frames were captured
+# (same-SSID multi-AP with wired/unseen backhaul = "backhaul ESS", not a real mesh).
+if not drawn_bh:
+    for k in ordered:
+        if k in uid and rootk in uid and k!=rootk: edge(uid[rootk],uid[k],'ESS (no backhaul seen)',EBH)
 percol=defaultdict(int)
 for sta,(k,b) in sorted(cl_unit.items()):
     if k not in ux: continue
@@ -833,7 +940,7 @@ for m in sorted(wired):
 cell('%s — network map  (AP units clustered best-effort)'%ssid, 80,150,520,24,'text;html=1;fontStyle=1;fontSize=13;')
 xml='<mxfile><diagram name="%s"><mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" page="1" pageWidth="1600" pageHeight="1100"><root><mxCell id="0"/><mxCell id="1" parent="0"/>%s</root></mxGraphModel></diagram></mxfile>'%(esc(ssid or 'net'),''.join(cells))
 open(out,'w',encoding='utf-8').write(xml)
-print('units=%d clients=%d wired=%d'%(len([k for k in units if k]),len(cl_unit),sum(1 for m in wired if mac2ip.get(m))))
+print('units=%d backhaul_links=%d clients=%d wired=%d'%(len([k for k in units if k]),len(bh_edges),len(cl_unit),sum(1 for m in wired if mac2ip.get(m))))
 PY
   local summary; summary="$("$PYBIN" -c "$GEN_PY" "$wd" "$out" 2>&1)"
   rm -rf "$wd"
