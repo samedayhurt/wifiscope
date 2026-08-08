@@ -570,19 +570,50 @@ hardware() {
      -e wps.model_number -e wps.device_name -e wps.serial_number | sort -u
 }
 
+# drop_group: filter out group-addressed (broadcast/multicast) MACs from a stream
+#   of one-MAC-per-line. The I/G bit is the low bit of the first octet, so a MAC is
+#   group-addressed exactly when the 2nd hex digit is odd (1,3,5,7,9,b,d,f) — e.g.
+#   ff:.. (broadcast), 01:00:5e:.. (IPv4 mcast), 33:33:.. (IPv6 mcast).
+drop_group() { awk '{ if (tolower(substr($0,2,1)) ~ /[13579bdf]/) next; print }'; }
+
+# no_aps: remove any known BSSID from a one-MAC-per-line stream (leaving stations).
+no_aps() {
+  if [ "${#ALL_BSSIDS[@]}" -gt 0 ]; then grep -vwiF -f <(printf '%s\n' "${ALL_BSSIDS[@]}"); else cat; fi
+}
+
+# station_macs: the UNION of every signal that a MAC is a client of the target
+#   network, not just the 4-way handshake:
+#     - association / reassociation requests (subtype 0/2) — carry the SSID, so we
+#       scope by name; the source is the client (works even for hidden SSIDs).
+#     - EAPOL frames scoped by the target BSSIDs (either side may be the client).
+#     - data uplink to the AP  (ToDS=1,FromDS=0): the transmitter is the client.
+#     - data downlink from the AP (ToDS=0,FromDS=1): the receiver is the client.
+#   WHY: handshake-only discovery (the old method) missed any client that was
+#        already associated before the capture began, or whose handshake landed in
+#        a channel-hop gap — yet those clients' data frames are all over the capture.
+#        Group-addressed MACs and known BSSIDs are stripped, leaving real stations.
+station_macs() {
+  {
+    ts -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
+       -T fields -e wlan.sa 2>/dev/null
+    ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null | tr '\t' '\n'
+    ts -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" \
+       -T fields -e wlan.sa 2>/dev/null
+    ts -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" \
+       -T fields -e wlan.da 2>/dev/null
+  } | tr '\t' '\n' | sort -u | grep . | drop_group | no_aps
+}
+
 # clients: list the wireless stations on the target network.
-#   WHY: association requests are often lost to channel hopping, so we use the
-#        4-way handshakes as ground truth — one non-AP MAC per handshake. Any MAC
-#        that is itself a BSSID is the AP side, so we filter those out.
+#   WHY: see station_macs — we no longer trust handshakes alone. The per-frame
+#        EAPOL table is still shown (it's the ground truth for key derivation), but
+#        the distinct-client list is the full union of association + data + EAPOL.
 clients() {
-  section "👥 wireless clients on $SSID (from EAPOL handshakes)"
+  section "👥 wireless clients on $SSID (assoc + data + EAPOL)"
   ts -Y "eapol && $(bssid_filter)" -T fields \
      -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr
-  section "distinct client MACs"
-  # sa/da flattened, de-duped, with every known BSSID removed -> just stations.
-  ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da \
-    | tr '\t' '\n' | sort -u | grep . \
-    | { if [ "${#ALL_BSSIDS[@]}" -gt 0 ]; then grep -vwF -f <(printf '%s\n' "${ALL_BSSIDS[@]}"); else cat; fi; }
+  section "distinct client MACs (all sources)"
+  station_macs
 }
 
 # keys: count PSKs, PTKs, and GTKs — and explain each number.
@@ -596,12 +627,13 @@ keys() {
   section "🔑 keys for $SSID"
   printf '%sPSK:%s 1  (single passphrase + single ESSID %s)\n' "$C_B" "$C_RESET" "$SSID"
 
-  local nclients
-  nclients="$(ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da \
-              | tr '\t' '\n' | sort -u | grep . \
-              | { if [ "${#ALL_BSSIDS[@]}" -gt 0 ]; then grep -vwF -f <(printf '%s\n' "${ALL_BSSIDS[@]}"); else cat; fi; } \
-              | wc -l | tr -d ' ')"
-  echo "PTK: $nclients  (one per client that completed a 4-way handshake)"
+  local nptk
+  nptk="$(ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null \
+          | tr '\t' '\n' | sort -u | grep . | drop_group | no_aps | wc -l | tr -d ' ')"
+  echo "PTK: $nptk  (one per client that completed a 4-way handshake)"
+  local nsta
+  nsta="$(station_macs | wc -l | tr -d ' ')"
+  echo "stations seen: $nsta  (all sources — assoc + data + EAPOL; ≥ PTK count)"
 
   echo "GTK in use: ${#TGT_BSSIDS[@]}  (one per fronthaul BSS = APs x active bands)"
 
@@ -636,8 +668,8 @@ topology() {
 #        where subnet and device identity live. A device seen here but never in a
 #        handshake is WIRED, not a wireless client.
 hosts() {
-  section "🏠 decryption sanity (ARP/IP frames after decrypt)"
-  tsd -Y 'arp || ip' | wc -l
+  section "🏠 decryption sanity (ARP / IPv4 / IPv6 frames after decrypt)"
+  tsd -Y 'arp || ip || ipv6' | wc -l
   section "subnet / gateway (DHCP options 1 & 3)"
   tsd -Y 'dhcp' -T fields \
       -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u
@@ -645,8 +677,17 @@ hosts() {
   tsd -Y 'dhcp' -T fields \
       -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
       -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u
-  section "ARP IP <-> MAC"
+  section "ARP IPv4 <-> MAC"
   tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac | sort -u
+  # IPv6 is invisible to ARP; neighbor discovery is its equivalent. The link-layer
+  # address option in NS/NA/RS/RA carries IPv6<->MAC, and DHCPv6's DUID-LL carries
+  # the client MAC — without these, every IPv6-only host is missed.
+  section "IPv6 neighbors (ICMPv6 ND link-layer option)"
+  tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields \
+      -e ipv6.src -e icmpv6.opt.linkaddr \
+      -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u
+  section "DHCPv6 (client IPv6 / DUID link-layer MAC)"
+  tsd -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll.link_layer_addr | sort -u
   section "hostname sweep (DHCP / NBNS / mDNS / LLMNR)"
   tsd -Y 'dhcp.option.hostname || nbns || mdns || llmnr' -T fields \
       -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.qry.name | sort -u
@@ -739,16 +780,34 @@ map() {
       -e wlan.ht.info.primarychannel -e radiotap.channel.freq 2>/dev/null | sort -u > "$wd/beacons.tsv"
   ts  -Y "wps.model_name && $(bssid_filter)" -T fields -e wps.manufacturer -e wps.model_name 2>/dev/null \
       | sort -u | head -1 > "$wd/wps.tsv"
-  ts  -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da -e wlan.bssid 2>/dev/null \
+  # client<->AP association pairs, unioned across all discovery sources (assoc /
+  # EAPOL / ToDS uplink / FromDS downlink) so the map shows clients that never
+  # completed a captured handshake — see station_macs() for the rationale.
+  {
+    ts -Y "(wlan.fc.type_subtype==0||wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
+       -T fields -e wlan.sa -e wlan.bssid 2>/dev/null
+    ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da -e wlan.bssid 2>/dev/null \
       | awk -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
-          {sa=tolower($1); sta=(sa in AP)?$2:$1; if(sta!="")print sta"\t"$3}' | sort -u > "$wd/clients.tsv"
+          {sa=tolower($1); sta=(sa in AP)?$2:$1; if(sta!="")print sta"\t"$3}'
+    ts -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" \
+       -T fields -e wlan.sa -e wlan.bssid 2>/dev/null
+    ts -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" \
+       -T fields -e wlan.da -e wlan.bssid 2>/dev/null
+  } | awk -F'\t' -v aps="${ALL_BSSIDS[*]}" 'BEGIN{OFS="\t";n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
+        { c=tolower($1); b=tolower($2);
+          if(c==""||b=="") next;
+          if(c in AP) next;                                 # client column is an AP
+          if(tolower(substr(c,2,1)) ~ /[13579bdf]/) next;   # group-addressed
+          print c,b }' | sort -u > "$wd/clients.tsv"
   ts  -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u > "$wd/backhaul.tsv"
   tsd -Y 'dhcp' -T fields -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
       -e dhcp.option.hostname -e dhcp.option.vendor_class_id 2>/dev/null | sort -u > "$wd/dhcp.tsv"
   tsd -Y 'dhcp.option.router' -T fields -e dhcp.option.router 2>/dev/null | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
   tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac 2>/dev/null | sort -u > "$wd/arp.tsv"
+  tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields -e icmpv6.opt.linkaddr -e ipv6.src 2>/dev/null | sort -u > "$wd/nd.tsv"
   tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name 2>/dev/null | sort -u > "$wd/names.tsv"
-  tsd -Y 'ip' -T fields -e ip.src -e _ws.col.protocol 2>/dev/null | sort -u > "$wd/proto.tsv"
+  { tsd -Y 'ip'   -T fields -e ip.src   -e _ws.col.protocol 2>/dev/null
+    tsd -Y 'ipv6' -T fields -e ipv6.src -e _ws.col.protocol 2>/dev/null; } | sort -u > "$wd/proto.tsv"
   printf '%s' "$SSID" > "$wd/ssid.txt"
   # --- generate the .drawio (python; script in a var so stdin stays free) ---
   local GEN_PY; read -r -d '' GEN_PY <<'PY'
@@ -806,6 +865,12 @@ for r in rd('dhcp.tsv'):
 mac2ip={}; ip2mac={}
 for r in rd('arp.tsv'):
     if len(r)>=2 and r[0] and r[1]: ip2mac[r[0]]=r[1].lower(); mac2ip[r[1].lower()]=r[0]
+# IPv6 neighbor discovery: link-layer option pairs a MAC with its IPv6 address, so
+# IPv6-only hosts (no ARP, no DHCPv4) still land on the map.
+mac2ip6={}
+for r in rd('nd.tsv'):
+    if len(r)>=2 and r[0] and r[1]: mac2ip6.setdefault(r[0].lower(), r[1])
+def anyip(mac): return mac2ip.get(mac) or mac2ip6.get(mac,'')
 ipname={}
 for r in rd('names.tsv'):
     if not r: continue
@@ -872,7 +937,7 @@ if rootk not in units:
     rootk=max(units,key=lambda k:sum(1 for s in cli for b in cli[s] if b in units[k])) if units else None
 def enrich(mac):
     mac=mac.lower(); d=dhcp.get(mac,{})
-    ip=d.get('ip') or mac2ip.get(mac,'')
+    ip=d.get('ip') or anyip(mac)
     host=d.get('host') or ipname.get(ip,'')
     return ip, host, d.get('vc',''), sorted(proto.get(ip,[]))[:6]
 cl_unit={}
@@ -882,7 +947,7 @@ for sta,bs in cli.items():
 known=set(apb)|set(cli)|{b for k in units for b in units[k]}|bh_macs
 # wired = decrypted L2 devices that aren't clients or APs — but NOT the gateway
 # (its MAC/IP is the router itself, drawn as the WAN uplink, not a host).
-wired=[m for m,ip in mac2ip.items() if m not in known and m!=gwmac and ip!=gwip]
+wired=[m for m in (set(mac2ip)|set(mac2ip6)) if m not in known and m!=gwmac and anyip(m) and anyip(m)!=gwip]
 cells=[]; nid=[1]
 def cell(label,x,y,w,h,style):
     i='n%d'%nid[0]; nid[0]+=1
@@ -940,7 +1005,7 @@ for m in sorted(wired):
 cell('%s — network map  (AP units clustered best-effort)'%ssid, 80,150,520,24,'text;html=1;fontStyle=1;fontSize=13;')
 xml='<mxfile><diagram name="%s"><mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" page="1" pageWidth="1600" pageHeight="1100"><root><mxCell id="0"/><mxCell id="1" parent="0"/>%s</root></mxGraphModel></diagram></mxfile>'%(esc(ssid or 'net'),''.join(cells))
 open(out,'w',encoding='utf-8').write(xml)
-print('units=%d backhaul_links=%d clients=%d wired=%d'%(len([k for k in units if k]),len(bh_edges),len(cl_unit),sum(1 for m in wired if mac2ip.get(m))))
+print('units=%d backhaul_links=%d clients=%d wired=%d'%(len([k for k in units if k]),len(bh_edges),len(cl_unit),sum(1 for m in wired if anyip(m))))
 PY
   local summary; summary="$("$PYBIN" -c "$GEN_PY" "$wd" "$out" 2>&1)"
   rm -rf "$wd"
