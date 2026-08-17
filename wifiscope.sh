@@ -979,18 +979,28 @@ _report_map_python() {
           if(tolower(substr(c,2,1)) ~ /[13579bdf]/) next;   # group-addressed
           print c,b }' | sort -u > "$wd/clients.tsv"
   ts  -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u > "$wd/backhaul.tsv"
-  tsd -Y 'dhcp' -T fields -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-      -e dhcp.option.hostname -e dhcp.option.vendor_class_id 2>/dev/null | sort -u > "$wd/dhcp.tsv"
-  tsd -Y 'dhcp.option.router' -T fields -e dhcp.option.router 2>/dev/null | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
-  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac 2>/dev/null | sort -u > "$wd/arp.tsv"
-  tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields -e icmpv6.opt.linkaddr -e ipv6.src 2>/dev/null | sort -u > "$wd/nd.tsv"
-  tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name 2>/dev/null | sort -u > "$wd/names.tsv"
-  { tsd -Y 'ip'   -T fields -e ip.src   -e _ws.col.protocol 2>/dev/null
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e _ws.col.protocol 2>/dev/null; } | sort -u > "$wd/proto.tsv"
+  # ONE decrypt pass feeds every L3 layer of the map (dhcp/gateway/arp/ND/names/
+  # protocols/conversations). Each tsd pass re-decrypts the whole capture, so nine
+  # separate passes were the dominant cost of an in-report map; split one buffer in
+  # AWK instead. Fields: 1 proto  2 ip.src 3 ip.dst  4 ipv6.src 5 ipv6.dst
+  #   6-10 dhcp(mac,reqip,your,host,vendor)  11 dhcp.router  12-13 arp(src ip,mac)
+  #   14 icmpv6.linkaddr  15 nbns.name  16 dns.resp.name
+  tsd -Y 'ip || ipv6 || arp' -T fields \
+      -e _ws.col.protocol -e ip.src -e ip.dst -e ipv6.src -e ipv6.dst \
+      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
+      -e dhcp.option.hostname -e dhcp.option.vendor_class_id -e dhcp.option.router \
+      -e arp.src.proto_ipv4 -e arp.src.hw_mac -e icmpv6.opt.linkaddr \
+      -e nbns.name -e dns.resp.name 2>/dev/null > "$wd/_l3.raw"
+  awk -F'\t' -v OFS='\t' 'tolower($1)~/dhcp|bootp/{print $6,$7,$8,$9,$10}' "$wd/_l3.raw" | sort -u > "$wd/dhcp.tsv"
+  awk -F'\t'             '$11!=""{print $11}'                              "$wd/_l3.raw" | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
+  awk -F'\t' -v OFS='\t' 'tolower($1)~/arp/{print $12,$13}'                "$wd/_l3.raw" | sort -u > "$wd/arp.tsv"
+  awk -F'\t' -v OFS='\t' '$14!=""{print $14,$4}'                          "$wd/_l3.raw" | sort -u > "$wd/nd.tsv"
+  awk -F'\t' -v OFS='\t' 'tolower($1)~/mdns|nbns/{print $2,$15,$16}'       "$wd/_l3.raw" | sort -u > "$wd/names.tsv"
+  awk -F'\t' -v OFS='\t' '{if($2!="")print $2,$1; if($4!="")print $4,$1}'  "$wd/_l3.raw" | sort -u > "$wd/proto.tsv"
   # observed L3 conversations (v4+v6) — drawn as dashed edges between hosts that
   # both appear on the map, i.e. real intra-LAN "who talks to whom".
-  { tsd -Y 'ip'   -T fields -e ip.src   -e ip.dst   2>/dev/null
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e ipv6.dst 2>/dev/null; } | sort -u > "$wd/conv.tsv"
+  awk -F'\t' -v OFS='\t' '{if($2!="")print $2,$3; if($4!="")print $4,$5}'  "$wd/_l3.raw" | sort -u > "$wd/conv.tsv"
+  rm -f "$wd/_l3.raw"
   printf '%s' "$title" > "$wd/ssid.txt"
   # --- generate the .drawio (python; script in a var so stdin stays free) ---
   local GEN_PY; read -r -d '' GEN_PY <<'PY'
