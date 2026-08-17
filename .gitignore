@@ -1,6 +1,7 @@
 # captures & anything derived from a real network — never commit
 *.pcap
 *.pcapng
+*.pcapppi
 *.cap
 *.keys
 *.hc22000
@@ -15,3 +16,5 @@ triage*.md
 # scratch
 *.tmp
 *.bak
+__pycache__/
+*.pyc
