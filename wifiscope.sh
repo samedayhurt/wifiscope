@@ -1553,27 +1553,28 @@ report() {
   pmkid_count="$(printf '%s\n' "$pmkid_rows" | grep -c '[^[:space:]]')"
   m3_count="$(tq -Y "eapol && wlan_rsna_eapol.keydes.msgnr==3 && $(bssid_filter)" -T fields -e frame.number | grep -c .)"
 
-  local decrypt_count dhcp_rows arp_rows nd_rows names_rows dns_rows software_rows
+  local decrypt_count dhcp_rows arp_rows nd_rows names_rows dns_rows software_rows _l3
   decrypt_count="$(tqd -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)" -T fields -e frame.number | grep -c .)"
-  dhcp_rows="$(tqd -Y "$(bssid_filter) && dhcp" -T fields -E occurrence=f \
-      -e frame.number -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address \
-      -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router \
-      -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u)"
-  arp_rows="$(tqd -Y "$(bssid_filter) && arp" -T fields -E occurrence=f \
-      -e frame.number -e arp.opcode -e arp.src.proto_ipv4 -e arp.src.hw_mac \
-      -e arp.dst.proto_ipv4 -e arp.dst.hw_mac | sort -u)"
-  nd_rows="$(tqd -Y "$(bssid_filter) && icmpv6 && icmpv6.opt.linkaddr" -T fields -E occurrence=f \
-      -e frame.number -e ipv6.src -e icmpv6.opt.linkaddr \
-      -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u)"
-  names_rows="$(tqd -Y "$(bssid_filter) && (dhcp.option.hostname || nbns || mdns || llmnr)" \
-      -T fields -E occurrence=f -e frame.number -e ip.src -e dhcp.option.hostname \
-      -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u)"
-  dns_rows="$(tqd -Y "$(bssid_filter) && (dns.qry.name || dns.resp.name)" -T fields -E occurrence=f \
-      -e frame.number -e ip.src -e ip.dst -e dns.qry.name -e dns.resp.name \
-      -e dns.a -e dns.aaaa | sort -u | head -n "$row_limit")"
-  software_rows="$(tqd -Y "$(bssid_filter) && (http.user_agent || http.server || ssh.protocol)" \
-      -T fields -E occurrence=f -e frame.number -e ip.src -e ip.dst \
-      -e http.user_agent -e http.server -e ssh.protocol | sort -u)"
+  # ONE decrypt pass feeds all six L3/name/service tables below. Each tqd pass
+  # re-dissects (and re-decrypts) the whole capture, so collapsing six passes into
+  # one — then routing rows by protocol/field in AWK — is the biggest report saving.
+  # Fields: 1 frame  2 proto | dhcp 3-9 | arp 10-14 | nd 15-18 | ip.src/dst 19-20
+  #         nbns 21  dns.resp 22  dns.qry 23  dns.a 24  dns.aaaa 25 | http/ssh 26-28
+  _l3="$(tqd -Y "$(bssid_filter) && (dhcp || arp || (icmpv6 && icmpv6.opt.linkaddr) || nbns || mdns || llmnr || dns.qry.name || dns.resp.name || http.user_agent || http.server || ssh.protocol)" \
+      -T fields -E occurrence=f \
+      -e frame.number -e _ws.col.protocol \
+      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
+      -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname -e dhcp.option.vendor_class_id \
+      -e arp.opcode -e arp.src.proto_ipv4 -e arp.src.hw_mac -e arp.dst.proto_ipv4 -e arp.dst.hw_mac \
+      -e ipv6.src -e icmpv6.opt.linkaddr -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address \
+      -e ip.src -e ip.dst -e nbns.name -e dns.resp.name -e dns.qry.name -e dns.a -e dns.aaaa \
+      -e http.user_agent -e http.server -e ssh.protocol)"
+  dhcp_rows="$(printf '%s\n' "$_l3"     | awk -F'\t' -v OFS='\t' 'tolower($2)~/dhcp|bootp/{print $1,$3,$4,$5,$6,$7,$8,$9}'    | sort -u | grep .)"
+  arp_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' 'tolower($2)~/arp/{print $1,$10,$11,$12,$13,$14}'            | sort -u | grep .)"
+  nd_rows="$(printf '%s\n' "$_l3"       | awk -F'\t' -v OFS='\t' '$16!=""{print $1,$15,$16,$17,$18}'                          | sort -u | grep .)"
+  names_rows="$(printf '%s\n' "$_l3"    | awk -F'\t' -v OFS='\t' '$8!=""||tolower($2)~/nbns|mdns|llmnr/{print $1,$19,$8,$21,$22,$23}' | sort -u | grep .)"
+  dns_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' '$23!=""||$22!=""{print $1,$19,$20,$23,$22,$24,$25}'         | sort -u | grep . | head -n "$row_limit")"
+  software_rows="$(printf '%s\n' "$_l3" | awk -F'\t' -v OFS='\t' '$26!=""||$27!=""||$28!=""{print $1,$19,$20,$26,$27,$28}'    | sort -u | grep .)"
 
   local station_rows assoc_rows action_rows wds_rows probe_rows
   station_rows="$({
