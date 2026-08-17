@@ -333,15 +333,44 @@ kr_add() {
 # rebuild_dec: turn the keyring file into tshark args in DEC[].
 #   Each key becomes its own  -o uat:80211_keys:"type","value"  (tshark APPENDS
 #   one UAT record per -o), plus a single enable-decryption switch up front.
+#
+#   Every value is normalized/validated FIRST, because tshark rejects the whole
+#   -o flag on a malformed key and then ABORTS the entire run — silently disabling
+#   ALL decryption, not just the bad key. That one-bad-key-kills-everything failure
+#   makes host inventory, GTK recovery, and the report's decrypted half come back
+#   empty even when the rest of the keyring is perfect. Sanitizing here keeps a
+#   legacy/hand-edited keyring from taking the whole session down.
 rebuild_dec() {
   DEC=()
   [ -n "$KEYRING" ] && [ -s "$KEYRING" ] || return
   DEC=(-o wlan.enable_decryption:TRUE)
-  local t v
+  local t v pass ssid skipped=0
   while IFS=$'\t' read -r t v; do
-    [ -n "$t" ] || continue
+    [ -n "$t" ] && [ -n "$v" ] || continue
+    case "$t" in
+      wpa-pwd)
+        # Format is  passphrase[:ssid]  with at MOST one ':'. Real SSIDs (and the
+        # BSSID/MAC identifiers that hidden-network targeting can produce) may
+        # contain ':' — those must be percent-encoded as %3a or tshark bails. Treat
+        # the first ':' as the separator and encode any colons in the SSID part.
+        if [[ "$v" == *:* ]]; then
+          pass="${v%%:*}"; ssid="${v#*:}"; ssid="${ssid//:/%3a}"; v="$pass:$ssid"
+        fi
+        ;;
+      wpa-psk|tk|wep|msk)
+        # Key material must be an even-length hex string (wpa-psk is exactly 64
+        # hex = 256-bit PMK). A non-hex value would abort tshark and take every
+        # other key with it, so drop it here and keep decrypting with the rest.
+        if ! [[ "$v" =~ ^[0-9a-fA-F]+$ ]] || [ $(( ${#v} % 2 )) -ne 0 ] \
+           || { [ "$t" = wpa-psk ] && [ "${#v}" -ne 64 ]; }; then
+          note "keyring: skipping malformed $t entry ($v)"; skipped=$((skipped+1)); continue
+        fi
+        ;;
+    esac
     DEC+=(-o "uat:80211_keys:\"$t\",\"$v\"")
   done < "$KEYRING"
+  [ "$skipped" -gt 0 ] && note "keyring: $skipped bad entr$([ "$skipped" = 1 ] && echo y || echo ies) ignored — decryption still uses the valid keys"
+  return 0
 }
 
 # pmk_hex: compute the 256-bit PMK/PSK from passphrase + SSID (WPA2-PSK).
@@ -1877,6 +1906,28 @@ selftest() {
          | drop_group | tr '\n' ',')"
   exp="de:ad:be:ef:00:01,aa:bb:cc:dd:ee:00,"
   [ "$got" = "$exp" ] && ok "drop_group keeps only unicast" || { note "FAIL drop_group: $got"; fail=1; }
+
+  # rebuild_dec must NEVER emit a key that makes tshark abort (one bad key would
+  # otherwise silently disable ALL decryption). A wpa-pwd whose SSID carries extra
+  # colons must be %3a-encoded, and non-hex key material must be dropped — while
+  # every valid key survives.
+  local old_kr="$KEYRING" old_dec_n="${#DEC[@]}"; local -a old_dec=("${DEC[@]:-}")
+  KEYRING="$(mktemp)"
+  printf 'wpa-pwd\t29536399:TP-LINK_C6A0\n'      >> "$KEYRING"   # normal, one colon
+  printf 'wpa-pwd\t29536399:2a:0b:8b:88:6c:18\n' >> "$KEYRING"   # SSID is a MAC: 5 extra colons
+  printf 'wpa-psk\tnothexZZ\n'                    >> "$KEYRING"   # junk PMK: must be dropped
+  printf 'tk\teb4b4390b81147bdb93f05382461926e\n' >> "$KEYRING"  # valid 128-bit TK
+  rebuild_dec 2>/dev/null
+  local dec_str="${DEC[*]}"
+  rm -f "$KEYRING"; KEYRING="$old_kr"; DEC=(); [ "$old_dec_n" -gt 0 ] && DEC=("${old_dec[@]}")
+  if [[ "$dec_str" == *'"wpa-pwd","29536399:2a%3a0b%3a8b%3a88%3a6c%3a18"'* ]] \
+     && [[ "$dec_str" == *'"wpa-pwd","29536399:TP-LINK_C6A0"'* ]] \
+     && [[ "$dec_str" == *'"tk","eb4b4390b81147bdb93f05382461926e"'* ]] \
+     && [[ "$dec_str" != *nothex* ]]; then
+    ok "rebuild_dec sanitizes keys (colon-encoded SSID, dropped junk PMK, kept valid keys)"
+  else
+    note "FAIL rebuild_dec sanitize: $dec_str"; fail=1
+  fi
 
   # IEEE WPA PBKDF2 test vector. This exercises the Bash/OpenSSL derivation path
   # without a pcap and proves Python is not part of key generation.
