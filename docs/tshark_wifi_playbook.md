@@ -1,15 +1,5 @@
 # 802.11 pcap post-processing playbook (tshark)
 
-This is the command-level companion to WiFiScope's `report` output. The report mirrors the WIBOC
-workflow: capture integrity → radio identity → crypto/hardware → EAPOL/PMKID → decryption sanity →
-TK/GTK context → L3 inventory → management/topology → protocols → capture quality → limitations.
-Each generated result includes its expanded, pasteable TShark command and a matching `.drawio`
-map. Key values are redacted unless `WIFISCOPE_REPORT_SECRETS=1` is explicitly set.
-
-Runtime boundary: recon, analysis, harvesting, PMKID export, `map`, and `mapall` are Bash/AWK.
-OpenSSL/xxd provide cryptographic and binary-stream primitives. Python3 is resolved only while
-`report` is producing its richer report-linked diagram; if absent, the report uses the Bash/AWK map.
-
 ## Setup
 
 ```bash
@@ -17,40 +7,6 @@ PCAP="oxide_20260303_183032_1.pcapng"
 
 # WPA decryption bundle
 DEC=(-o wlan.enable_decryption:TRUE -o 'uat:80211_keys:"wpa-pwd","PASSPHRASE:SSID"')
-```
-
-Load these once when copying commands out of a report:
-
-```bash
-tsv_columns() {
-  if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi
-}
-table_rows() { tsv_columns; }
-table_unique() {
-  local header
-  IFS= read -r header || return 0
-  { printf '%s\n' "$header"; LC_ALL=C sort -u; } | tsv_columns
-}
-table_count() {
-  local header
-  IFS= read -r header || return 0
-  { printf 'COUNT\t%s\n' "$header"; LC_ALL=C sort | uniq -c |
-    sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+/\1\t/'; } | tsv_columns
-}
-```
-
-For clean field output, use this shape consistently:
-
-```bash
-tshark -r "$PCAP" "${DEC[@]}" \
-  -Y 'DISPLAY_FILTER' \
-  -T fields \
-  -E separator=/t \
-  -E occurrence=f \
-  -E header=y \
-  -e frame.number \
-  -e frame.time \
-  | table_rows
 ```
 
 Field names that bite: handshake key data is `wlan_rsna_eapol.keydes.*` not `eapol.keydes.*`.
@@ -152,23 +108,6 @@ digit odd) and known BSSIDs afterward:
 } | tr '\t' '\n' | sort -u | grep .
 ```
 
-A station seen only receiving M1 is a station observation, not a recovered PTK. Count a
-recoverable/crackable station↔BSSID context only when `(M1 && M2) || (M2 && M3)` is present.
-
-## PMKID
-
-Do not require EAPOL. PMKID evidence is normally carried in association RSN information:
-
-```bash
-tshark -r "$PCAP" \
-  -Y 'wlan.bssid==BSSID && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)' \
-  -T fields -E separator=/t -E occurrence=f -E header=y \
-  -e frame.number -e frame.time -e wlan.fc.type_subtype \
-  -e wlan.sa -e wlan.da -e wlan.bssid \
-  -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
-  | table_rows
-```
-
 ## Hidden SSIDs
 
 Hidden APs beacon with a zero-length SSID; recover the name from frames that carry it:
@@ -194,7 +133,7 @@ tshark -r "$PCAP" "${DEC[@]}" -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll
 ## Keys
 
 - PSK count = distinct passphrase+SSID pairs (usually 1).
-- Recoverable PTK-context count = distinct station↔BSSID contexts with M1+M2 or M2+M3.
+- PTK count = distinct client↔AP handshakes.
 - GTK in use = fronthaul BSSes = APs × active bands (per-BSS key).
 - GTK recoverable = handshakes complete enough to derive the PTK (blank if msg1 missing).
 
@@ -210,37 +149,6 @@ tshark -r "$PCAP" "${DEC[@]}" -Y 'wlan_rsna_eapol.keydes.msgnr==3' \
 # GTK field name from a decrypted msg3
 tshark -r "$PCAP" "${DEC[@]}" -Y 'frame.number==N' -V | grep -iE 'GTK|Key ID'
 ```
-
-Modern Wireshark/TShark builds can expose the PTK components selected for a decoded context. Keep
-the BSSID, station, message, and replay counter attached; a bare key list loses attribution:
-
-```bash
-tshark -r "$PCAP" "${DEC[@]}" \
-  -Y 'wlan.analysis.kck || wlan.analysis.kek || wlan.analysis.tk' \
-  -T fields -E separator=/t -E occurrence=f -E header=y \
-  -e frame.number -e frame.time -e wlan.bssid -e wlan.staa \
-  -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
-  -e wlan.analysis.pmk -e wlan.analysis.kck -e wlan.analysis.kek -e wlan.analysis.tk \
-  | table_unique
-```
-
-Extract GTK/IGTK/BIGTK from decrypted M3 with its full context:
-
-```bash
-tshark -r "$PCAP" "${DEC[@]}" \
-  -Y 'eapol && wlan_rsna_eapol.keydes.msgnr==3 && (wlan.rsn.ie.gtk_kde.gtk || wlan.rsn.ie.igtk.kde.igtk || wlan.rsn.ie.bigtk_kde.bigtk)' \
-  -T fields -E separator=/t -E occurrence=f -E header=y \
-  -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
-  -e eapol.keydes.replay_counter \
-  -e wlan.rsn.ie.gtk_kde.key_id -e wlan.rsn.ie.gtk_kde.tx -e wlan.rsn.ie.gtk_kde.gtk \
-  -e wlan.rsn.ie.igtk.kde.keyid -e wlan.rsn.ie.igtk.kde.ipn -e wlan.rsn.ie.igtk.kde.igtk \
-  -e wlan.rsn.ie.bigtk_kde.key_id -e wlan.rsn.ie.bigtk_kde.bipn -e wlan.rsn.ie.bigtk_kde.bigtk \
-  | table_unique
-```
-
-If M3 exists but the GTK is empty, check for a valid passphrase/PMK, both nonce contexts, a derived
-KEK, encrypted key-data length, and version compatibility. A supplied `tk` can decrypt some
-pairwise traffic but cannot by itself unwrap the GTK KDE in M3.
 
 ## Topology (mesh AP count)
 
@@ -298,41 +206,3 @@ tshark -r "$PCAP" "${DEC[@]}" -Y 'http.user_agent || http.server || ssh.protocol
 # per-host protocols
 tshark -r "$PCAP" "${DEC[@]}" -Y 'ip.src==IP' -T fields -e ip.src -e _ws.col.protocol | sort -u
 ```
-
-## Capture quality
-
-```bash
-# Truncated frames: payload conclusions may be incomplete.
-tshark -r "$PCAP" -Y 'frame.cap_len < frame.len' \
-  -T fields -E separator=/t -E occurrence=f -E header=y \
-  -e frame.number -e frame.time -e frame.cap_len -e frame.len -e wlan.bssid \
-  | table_rows
-
-# Target retries: useful RF/contention evidence, but not unique traffic.
-tshark -r "$PCAP" -Y 'wlan.bssid==BSSID && wlan.fc.retry==1' \
-  -T fields -E separator=/t -E occurrence=f -E header=y \
-  -e frame.number -e frame.time -e wlan.fc.type_subtype \
-  -e wlan.sa -e wlan.da -e wlan.seq -e radiotap.dbm_antsignal \
-  | table_rows
-```
-
-## Report and draw.io evidence rules
-
-Run the full evidence pass with:
-
-```bash
-./wifiscope.sh report "$PCAP" "SSID" "PASSPHRASE"
-```
-
-The report and diagram use the same evidence model:
-
-- **Observed:** a matching frame/field exists in the capture.
-- **Inferred/correlated:** multiple observations support a role, but do not directly prove it.
-- **Not observed:** no matching evidence was captured; this is not proof of absence.
-- A node is labeled `GATEWAY / AP (confirmed)` only after an exact DHCP router IP → ARP MAC →
-  beacon BSSID match. Similar MAC ranges, WDS degree, or client count produce `ROOT CANDIDATE`.
-- A DHCP option 3 value is a LAN default gateway, not automatically an Internet/ISP or WAN IP.
-- Four-address/WDS rows are capture-wide when no ordinary BSSID is available and must be correlated
-  before assigning them to the target ESS.
-- Normal reports redact passphrases, PSKs, TKs, and GTKs. `keymaterial` deliberately prints them;
-  `WIFISCOPE_REPORT_SECRETS=1` opts a controlled training report into literal values.

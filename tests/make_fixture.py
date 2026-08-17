@@ -9,7 +9,6 @@
 #   * a WPA3-SAE net "Modern3" and a WPA2-Enterprise net "CorpNet"
 #   * a hidden AP (blank-SSID beacon) whose name "SecretNet" leaks in a probe resp
 #   * one client: association request + a full 4-way EAPOL handshake + ToDS data
-#   * one M1-only station, proving that a handshake start is not a recovered PTK
 #
 # MACs are laid out so ukey()/near() cluster each physical unit correctly:
 #   root radios share octets 3-5 = 22:aa:bb, satellite = 22:cc:dd.
@@ -113,11 +112,6 @@ pkts.append(eapol_key(ROOT_24, CLI, ROOT_24, KI[1], AN, to_ds=False))   # AP->ST
 pkts.append(eapol_key(CLI, ROOT_24, ROOT_24, KI[2], SN, to_ds=True))    # STA->AP
 pkts.append(eapol_key(ROOT_24, CLI, ROOT_24, KI[3], AN, to_ds=False))   # AP->STA
 pkts.append(eapol_key(CLI, ROOT_24, ROOT_24, KI[4], b'\x00'*32, to_ds=True))  # STA->AP
-
-# A second station only receives M1. It is a valid station observation, but must
-# never increment the "recoverable PTK context" count.
-CLI_M1 = 'aa:bb:cc:00:00:02'
-pkts.append(eapol_key(ROOT_24, CLI_M1, ROOT_24, KI[1], AN, to_ds=False))
 
 # ToDS data uplink (client transmits to AP) — extra station-discovery evidence.
 pkts.append(frame(2437, Dot11(type=2, subtype=0, FCfield='to-DS',
