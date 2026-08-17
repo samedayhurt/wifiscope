@@ -1311,16 +1311,23 @@ map() {
       {c=tolower($1);b=tolower($2);if(c==""||b==""||c in AP||tolower(substr(c,2,1))~/[13579bdf]/)next;print c,b}' \
     | sort -u > "$wd/clients.tsv"
   ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra | sort -u > "$wd/backhaul.tsv"
-  tsd -Y 'dhcp' -T fields -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-    -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u > "$wd/dhcp.tsv"
-  tsd -Y 'dhcp.option.router' -T fields -e dhcp.option.router | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
-  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac | sort -u > "$wd/arp.tsv"
-  tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields -e icmpv6.opt.linkaddr -e ipv6.src | sort -u > "$wd/nd.tsv"
-  tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name | sort -u > "$wd/names.tsv"
-  { tsd -Y 'ip' -T fields -e ip.src -e _ws.col.protocol
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e _ws.col.protocol; } | sort -u > "$wd/proto.tsv"
-  { tsd -Y 'ip' -T fields -e ip.src -e ip.dst
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e ipv6.dst; } | sort -u > "$wd/conv.tsv"
+  # One decrypt pass for every L3 layer (see _report_map_python for the rationale):
+  # fields 1 proto 2 ip.src 3 ip.dst 4 ipv6.src 5 ipv6.dst 6-10 dhcp 11 dhcp.router
+  #        12-13 arp 14 icmpv6.linkaddr 15 nbns.name 16 dns.resp.name
+  tsd -Y 'ip || ipv6 || arp' -T fields \
+      -e _ws.col.protocol -e ip.src -e ip.dst -e ipv6.src -e ipv6.dst \
+      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
+      -e dhcp.option.hostname -e dhcp.option.vendor_class_id -e dhcp.option.router \
+      -e arp.src.proto_ipv4 -e arp.src.hw_mac -e icmpv6.opt.linkaddr \
+      -e nbns.name -e dns.resp.name > "$wd/_l3.raw"
+  awk -F'\t' -v OFS='\t' 'tolower($1)~/dhcp|bootp/{print $6,$7,$8,$9,$10}' "$wd/_l3.raw" | sort -u > "$wd/dhcp.tsv"
+  awk -F'\t'             '$11!=""{print $11}'                              "$wd/_l3.raw" | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
+  awk -F'\t' -v OFS='\t' 'tolower($1)~/arp/{print $12,$13}'                "$wd/_l3.raw" | sort -u > "$wd/arp.tsv"
+  awk -F'\t' -v OFS='\t' '$14!=""{print $14,$4}'                          "$wd/_l3.raw" | sort -u > "$wd/nd.tsv"
+  awk -F'\t' -v OFS='\t' 'tolower($1)~/mdns|nbns/{print $2,$15,$16}'       "$wd/_l3.raw" | sort -u > "$wd/names.tsv"
+  awk -F'\t' -v OFS='\t' '{if($2!="")print $2,$1; if($4!="")print $4,$1}'  "$wd/_l3.raw" | sort -u > "$wd/proto.tsv"
+  awk -F'\t' -v OFS='\t' '{if($2!="")print $2,$3; if($4!="")print $4,$5}'  "$wd/_l3.raw" | sort -u > "$wd/conv.tsv"
+  rm -f "$wd/_l3.raw"
 
   awk -F'\t' -v title="$title" -v summaryfile="$wd/summary.txt" \
     -v beaconfile="$wd/beacons.tsv" -v wpsfile="$wd/wps.tsv" -v clientfile="$wd/clients.tsv" \
