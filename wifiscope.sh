@@ -320,54 +320,66 @@ set_key() {
 #  every tshark call rebuilds its decryption args from it.
 # =============================================================================
 
-# kr_add TYPE VALUE: append a key to the keyring, skipping exact duplicates.
-#   TYPE is a tshark UAT key type: wpa-pwd | wpa-psk | tk | wep | msk.
-#   Stored as "type<TAB>value" so values containing ':' (wpa-pwd) stay intact.
-kr_add() {
-  local line; line="$(printf '%s\t%s' "$1" "$2")"
-  [ -n "$KEYRING" ] || { note "no keyring path set (load a pcap first)"; return; }
-  touch "$KEYRING"
-  grep -Fxq "$line" "$KEYRING" 2>/dev/null || printf '%s\n' "$line" >> "$KEYRING"
+# kr_normalize TYPE VALUE: the single source of truth for what tshark will accept
+#   as a  -o uat:80211_keys:"type","value"  record. On success it prints the
+#   normalized "type<TAB>value" and returns 0; on failure it prints a human reason
+#   and returns non-zero. This exists because tshark does NOT skip a bad UAT record
+#   — it rejects the -o flag and ABORTS the whole invocation, silently disabling
+#   EVERY key. So one 1-char passphrase, stray ANSI byte, CRLF, or wrong-length hex
+#   would blank all decryption. Enforcing the same rules on read (rebuild_dec) and
+#   write (kr_add) means a legacy/hand-edited keyring can never take the tool down.
+kr_normalize() {
+  local t="$1" v="$2" pass ssid
+  t="${t%$'\r'}"; v="${v%$'\r'}"                       # tolerate CRLF keyrings
+  case "$t" in ''|'#'*) printf 'blank or comment line'; return 1 ;; esac
+  case "$v" in *[$'\001'-$'\037'$'\177']*) printf 'value contains a control character'; return 1 ;; esac
+  case "$v" in *'"'*|*'\'*) printf 'value contains a quote or backslash'; return 1 ;; esac
+  case "$t" in
+    wpa-pwd)
+      # passphrase[:ssid], at most one ':'. tshark requires 8..63-char passphrase;
+      # colons inside the SSID must be %3a-encoded or the -o flag is rejected.
+      pass="${v%%:*}"; [ "$pass" = "$v" ] && ssid="" || ssid="${v#*:}"
+      if [ "${#pass}" -lt 8 ] || [ "${#pass}" -gt 63 ]; then
+        printf 'wpa-pwd passphrase must be 8-63 chars (got %d)' "${#pass}"; return 1
+      fi
+      [ -n "$ssid" ] && v="$pass:${ssid//:/%3a}" || v="$pass"
+      ;;
+    wpa-psk) [[ "$v" =~ ^[0-9a-fA-F]{64}$ ]]            || { printf 'wpa-psk must be 64 hex chars'; return 1; } ;;
+    tk)      [[ "$v" =~ ^([0-9a-fA-F]{32}|[0-9a-fA-F]{64})$ ]] || { printf 'tk must be 32 or 64 hex chars'; return 1; } ;;
+    wep)     [[ "$v" =~ ^([0-9a-fA-F]{10}|[0-9a-fA-F]{26}|[0-9a-fA-F]{32})$ ]] || { printf 'wep must be 10/26/32 hex chars'; return 1; } ;;
+    msk)     { [[ "$v" =~ ^[0-9a-fA-F]+$ ]] && [ $(( ${#v} % 2 )) -eq 0 ] && [ "${#v}" -ge 32 ] && [ "${#v}" -le 256 ]; } \
+                                                        || { printf 'msk must be 32-256 hex chars'; return 1; } ;;
+    *) printf "unknown key type '%s'" "$t"; return 1 ;;
+  esac
+  printf '%s\t%s' "$t" "$v"
 }
 
-# rebuild_dec: turn the keyring file into tshark args in DEC[].
-#   Each key becomes its own  -o uat:80211_keys:"type","value"  (tshark APPENDS
-#   one UAT record per -o), plus a single enable-decryption switch up front.
-#
-#   Every value is normalized/validated FIRST, because tshark rejects the whole
-#   -o flag on a malformed key and then ABORTS the entire run — silently disabling
-#   ALL decryption, not just the bad key. That one-bad-key-kills-everything failure
-#   makes host inventory, GTK recovery, and the report's decrypted half come back
-#   empty even when the rest of the keyring is perfect. Sanitizing here keeps a
-#   legacy/hand-edited keyring from taking the whole session down.
+# kr_add TYPE VALUE: append a key to the keyring, validating it FIRST (so garbage
+#   never reaches disk) and skipping exact duplicates. Stored as "type<TAB>value".
+kr_add() {
+  [ -n "$KEYRING" ] || { note "no keyring path set (load a pcap first)"; return 1; }
+  local norm; norm="$(kr_normalize "$1" "$2")" \
+    || { note "refusing to store invalid $1 key — $norm"; return 1; }
+  touch "$KEYRING"
+  grep -Fxq "$norm" "$KEYRING" 2>/dev/null || printf '%s\n' "$norm" >> "$KEYRING"
+}
+
+# rebuild_dec: turn the keyring file into tshark args in DEC[]. Each valid key
+#   becomes its own  -o uat:80211_keys:"type","value"  (tshark APPENDS one UAT
+#   record per -o), plus a single enable-decryption switch up front. Invalid lines
+#   are skipped with a reason instead of aborting the whole run (see kr_normalize).
 rebuild_dec() {
   DEC=()
   [ -n "$KEYRING" ] && [ -s "$KEYRING" ] || return
   DEC=(-o wlan.enable_decryption:TRUE)
-  local t v pass ssid skipped=0
+  local t v norm skipped=0
   while IFS=$'\t' read -r t v; do
-    [ -n "$t" ] && [ -n "$v" ] || continue
-    case "$t" in
-      wpa-pwd)
-        # Format is  passphrase[:ssid]  with at MOST one ':'. Real SSIDs (and the
-        # BSSID/MAC identifiers that hidden-network targeting can produce) may
-        # contain ':' — those must be percent-encoded as %3a or tshark bails. Treat
-        # the first ':' as the separator and encode any colons in the SSID part.
-        if [[ "$v" == *:* ]]; then
-          pass="${v%%:*}"; ssid="${v#*:}"; ssid="${ssid//:/%3a}"; v="$pass:$ssid"
-        fi
-        ;;
-      wpa-psk|tk|wep|msk)
-        # Key material must be an even-length hex string (wpa-psk is exactly 64
-        # hex = 256-bit PMK). A non-hex value would abort tshark and take every
-        # other key with it, so drop it here and keep decrypting with the rest.
-        if ! [[ "$v" =~ ^[0-9a-fA-F]+$ ]] || [ $(( ${#v} % 2 )) -ne 0 ] \
-           || { [ "$t" = wpa-psk ] && [ "${#v}" -ne 64 ]; }; then
-          note "keyring: skipping malformed $t entry ($v)"; skipped=$((skipped+1)); continue
-        fi
-        ;;
-    esac
-    DEC+=(-o "uat:80211_keys:\"$t\",\"$v\"")
+    [ -n "$t$v" ] || continue
+    if norm="$(kr_normalize "$t" "$v")"; then
+      DEC+=(-o "uat:80211_keys:\"${norm%%$'\t'*}\",\"${norm#*$'\t'}\"")
+    else
+      note "keyring: ignoring entry ($norm)"; skipped=$((skipped+1))
+    fi
   done < "$KEYRING"
   [ "$skipped" -gt 0 ] && note "keyring: $skipped bad entr$([ "$skipped" = 1 ] && echo y || echo ies) ignored — decryption still uses the valid keys"
   return 0
@@ -712,15 +724,18 @@ no_aps() {
 #        a channel-hop gap — yet those clients' data frames are all over the capture.
 #        Group-addressed MACs and known BSSIDs are stripped, leaving real stations.
 station_macs() {
+  # -E occurrence=f collapses A-MSDU frames (which repeat wlan.sa/wlan.da per
+  # subframe) to one MAC; the final `tr ',\t'` also splits any comma-joined value
+  # so an aggregated frame can never inflate the distinct-station count.
   {
     ts -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
-       -T fields -e wlan.sa 2>/dev/null
-    ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null | tr '\t' '\n'
+       -T fields -E occurrence=f -e wlan.sa 2>/dev/null
+    ts -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.da 2>/dev/null | tr ',\t' '\n'
     ts -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" \
-       -T fields -e wlan.sa 2>/dev/null
+       -T fields -E occurrence=f -e wlan.sa 2>/dev/null
     ts -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" \
-       -T fields -e wlan.da 2>/dev/null
-  } | tr '\t' '\n' | sort -u | grep . | drop_group | no_aps
+       -T fields -E occurrence=f -e wlan.da 2>/dev/null
+  } | tr ',\t' '\n' | sort -u | grep . | drop_group | no_aps
 }
 
 # clients: list the wireless stations on the target network.
@@ -1275,12 +1290,12 @@ map() {
     -T fields -e wlan.bssid -e wps.manufacturer -e wps.model_name -e wps.model_number \
     -e wps.device_name -e wps.serial_number -e wps.os_version | sort -u > "$wd/wps.tsv"
   {
-    ts -Y "$afilt" -T fields -e wlan.sa -e wlan.bssid
-    ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da -e wlan.bssid \
+    ts -Y "$afilt" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid
+    ts -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.da -e wlan.bssid \
       | awk -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
           {sa=tolower($1);sta=(sa in AP)?$2:$1;if(sta!="")print sta"\t"$3}'
-    ts -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -e wlan.sa -e wlan.bssid
-    ts -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -e wlan.da -e wlan.bssid
+    ts -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid
+    ts -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.da -e wlan.bssid
   } | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
       BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
       {c=tolower($1);b=tolower($2);if(c==""||b==""||c in AP||tolower(substr(c,2,1))~/[13579bdf]/)next;print c,b}' \
@@ -1562,10 +1577,10 @@ report() {
 
   local station_rows assoc_rows action_rows wds_rows probe_rows
   station_rows="$({
-      tq -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" -T fields -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"association"}'
-      tq -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da -e wlan.bssid | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}{sa=tolower($1);da=tolower($2);b=tolower($3);s=(sa in AP)?da:sa;if(s&&b)print s,b,"EAPOL"}'
-      tq -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"uplink data"}'
-      tq -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -e wlan.da -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"downlink data"}'
+      tq -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"association"}'
+      tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.da -e wlan.bssid | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}{sa=tolower($1);da=tolower($2);b=tolower($3);s=(sa in AP)?da:sa;if(s&&b)print s,b,"EAPOL"}'
+      tq -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"uplink data"}'
+      tq -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.da -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"downlink data"}'
     } | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
          BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
          {c=tolower($1); if(c=="" || c in AP || tolower(substr(c,2,1)) ~ /[13579bdf]/)next;
@@ -1828,18 +1843,16 @@ REPORT_HELPERS
     report_command 1 'table_unique' -Y "$(bssid_filter) && (http.user_agent || http.server || ssh.protocol)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e ip.src -e ip.dst \
       -e http.user_agent -e http.server -e ssh.protocol
-    echo; echo '### Decrypted protocol hierarchy'
-    echo '```text'; tqd -Y "$(bssid_filter)" -q -z io,phs; echo '```'
-    report_command 1 '' -Y "$(bssid_filter)" -q -z io,phs
-    echo; echo '### IP endpoints'
-    echo '```text'; tqd -Y "$(bssid_filter)" -q -z endpoints,ip; echo '```'
-    report_command 1 '' -Y "$(bssid_filter)" -q -z endpoints,ip
-    echo; echo '### TCP conversations'
-    echo '```text'; tqd -Y "$(bssid_filter)" -q -z conv,tcp; echo '```'
-    report_command 1 '' -Y "$(bssid_filter)" -q -z conv,tcp
-    echo; echo '### UDP conversations'
-    echo '```text'; tqd -Y "$(bssid_filter)" -q -z conv,udp; echo '```'
-    report_command 1 '' -Y "$(bssid_filter)" -q -z conv,udp
+    # One decrypt pass emits all four statistics tables (tshark accepts repeated
+    # -z), instead of re-dissecting the whole capture four times.
+    echo; echo '### Decrypted L3 statistics (protocol hierarchy, IP endpoints, TCP/UDP conversations)'
+    local l3stats; l3stats="$(tqd -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp)"
+    if printf '%s' "$l3stats" | grep -q '[^[:space:]]'; then
+      echo '```text'; printf '%s\n' "$l3stats"; echo '```'
+      report_command 1 '' -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp
+    else
+      echo '_No matching evidence observed (decryption produced no L3 traffic for this target)._'
+    fi
 
     echo; echo '## 10. Capture-quality checks'
     printf '| Check | Count | Interpretation |\n| --- | ---: | --- |\n'
@@ -1908,26 +1921,39 @@ selftest() {
   [ "$got" = "$exp" ] && ok "drop_group keeps only unicast" || { note "FAIL drop_group: $got"; fail=1; }
 
   # rebuild_dec must NEVER emit a key that makes tshark abort (one bad key would
-  # otherwise silently disable ALL decryption). A wpa-pwd whose SSID carries extra
-  # colons must be %3a-encoded, and non-hex key material must be dropped — while
-  # every valid key survives.
+  # otherwise silently disable ALL decryption). Every class tshark rejects — short/
+  # long passphrase, control byte, wrong-length hex, bad type, unescaped quote — must
+  # be dropped, a colon-bearing SSID must be %3a-encoded, and CRLF must be tolerated,
+  # while every valid key survives. Each fixture below is a real abort class.
   local old_kr="$KEYRING" old_dec_n="${#DEC[@]}"; local -a old_dec=("${DEC[@]:-}")
   KEYRING="$(mktemp)"
-  printf 'wpa-pwd\t29536399:TP-LINK_C6A0\n'      >> "$KEYRING"   # normal, one colon
-  printf 'wpa-pwd\t29536399:2a:0b:8b:88:6c:18\n' >> "$KEYRING"   # SSID is a MAC: 5 extra colons
-  printf 'wpa-psk\tnothexZZ\n'                    >> "$KEYRING"   # junk PMK: must be dropped
-  printf 'tk\teb4b4390b81147bdb93f05382461926e\n' >> "$KEYRING"  # valid 128-bit TK
+  {
+    printf 'wpa-pwd\t29536399:TP-LINK_C6A0\n'          # valid, one colon
+    printf 'wpa-pwd\t29536399:2a:0b:8b:88:6c:18\n'     # SSID is a MAC: colons -> %3a
+    printf 'wpa-pwd\t1:\033[F\n'                       # 1-char pass + ANSI escape (the shipped bug)
+    printf 'wpa-pwd\t%s:net\n' "$(printf 'a%.0s' $(seq 64))"  # 64-char passphrase (>63)
+    printf 'wpa-psk\tnothexZZ\n'                       # junk PMK
+    printf 'tk\teb4b4390b81147bdb93f05382461926e\n'    # valid 128-bit TK
+    printf 'tk\teb4b4390b81147bd\n'                    # 16 hex = wrong TK length
+    printf 'wep\tabcd\n'                               # wrong WEP length
+    printf 'bogus\txx\n'                               # unknown type
+    printf 'wpa-psk\t9d9ec2f803cbafda75480beec881f2af537f1fadeb131f39406fa2f89d0ca2e1\r\n'  # valid PSK, CRLF
+  } > "$KEYRING"
   rebuild_dec 2>/dev/null
   local dec_str="${DEC[*]}"
   rm -f "$KEYRING"; KEYRING="$old_kr"; DEC=(); [ "$old_dec_n" -gt 0 ] && DEC=("${old_dec[@]}")
-  if [[ "$dec_str" == *'"wpa-pwd","29536399:2a%3a0b%3a8b%3a88%3a6c%3a18"'* ]] \
-     && [[ "$dec_str" == *'"wpa-pwd","29536399:TP-LINK_C6A0"'* ]] \
-     && [[ "$dec_str" == *'"tk","eb4b4390b81147bdb93f05382461926e"'* ]] \
-     && [[ "$dec_str" != *nothex* ]]; then
-    ok "rebuild_dec sanitizes keys (colon-encoded SSID, dropped junk PMK, kept valid keys)"
-  else
-    note "FAIL rebuild_dec sanitize: $dec_str"; fail=1
-  fi
+  local kr_ok=1
+  # the three valid keys survive (CRLF stripped)...
+  for good in '"wpa-pwd","29536399:TP-LINK_C6A0"' \
+              '"wpa-pwd","29536399:2a%3a0b%3a8b%3a88%3a6c%3a18"' \
+              '"tk","eb4b4390b81147bdb93f05382461926e"' \
+              '"wpa-psk","9d9ec2f803cbafda75480beec881f2af537f1fadeb131f39406fa2f89d0ca2e1"'; do
+    [[ "$dec_str" == *"$good"* ]] || kr_ok=0
+  done
+  # ...and every abort class is gone (no ESC, no short/long pass, no bad hex/type/CR).
+  case "$dec_str" in *$'\033'*|*'"1:'*|*aaaaaaaa*|*nothex*|*'"tk","eb4b4390b81147bd"'*|*'"wep"'*|*bogus*|*$'\r'*) kr_ok=0 ;; esac
+  [ "$kr_ok" = 1 ] && ok "rebuild_dec drops every tshark-abort key class and keeps the valid ones" \
+                   || { note "FAIL rebuild_dec sanitize: $dec_str"; fail=1; }
 
   # IEEE WPA PBKDF2 test vector. This exercises the Bash/OpenSSL derivation path
   # without a pcap and proves Python is not part of key generation.
