@@ -719,28 +719,41 @@ hardware() {
   local -a tgt=(); [ "${#TGT_BSSIDS[@]}" -gt 0 ] && tgt=("${TGT_BSSIDS[@]}")
   wps_tgt="$(printf '%s\n' "$wps_all" | awk -F'\t' -v t="${tgt[*]}" 'BEGIN{n=split(tolower(t),a," ");for(i=1;i<=n;i++)T[a[i]]=1} (tolower($1) in T)')"
 
-  section "🏷️  make / model / firmware for $SSID (WPS)"
+  # The router's OWN LAN IP (DHCP default-gateway option) and the banners it serves.
+  # A TP-Link/whatever whose beacon WPS IE carries only version/state still reveals
+  # its model+firmware in its UPnP/HTTP server string (e.g. "UPnP/1.0 TL-WR841N/9.0").
+  local gw gw_ident
+  gw="$(tsd -Y "$(bssid_filter) && dhcp.option.router" -T fields -E occurrence=f -e dhcp.option.router 2>/dev/null \
+       | tr ',' '\n' | grep -m1 -E '^[0-9]+\.[0-9]')"
+  [ -n "$gw" ] && gw_ident="$(tsd -Y "ip.src==$gw && http.server" -T fields -E occurrence=f -e http.server 2>/dev/null \
+       | awk 'NF' | sort -u)"
+
+  section "🏷️  router / device identity for $SSID"
   if [ -n "$wps_tgt" ]; then
+    echo "Source: WPS information element (authoritative)"
     { printf '%s\n' "$hdr"; printf '%s\n' "$wps_tgt"; } | md_table_or_tsv
+  elif [ -n "$gw_ident" ]; then
+    printf 'Router at DHCP gateway %s (= this network'\''s AP):\n' "$gw"
+    printf '%s\n' "$gw_ident" | tcol 'Model / firmware (from the router'\''s UPnP/HTTP server string)'
+    note "$SSID's beacon WPS IE carries version/state only — model/firmware taken from the router's own banner above"
   else
-    note "$SSID advertised no WPS identity (its WPS IE is empty or absent)"
-    if [ -n "$wps_all" ]; then
-      section "WPS identities seen ELSEWHERE in this capture (neighbors — NOT $SSID)"
-      { printf '%s\n' "$hdr"; printf '%s\n' "$wps_all"; } | md_table_or_tsv
-    fi
+    note "no make/model for $SSID via WPS; $([ "${#DEC[@]}" -gt 0 ] && echo 'and its UPnP/HTTP banner was not observed' || echo 'enable decryption (k/harvest) to read its UPnP/HTTP banner')"
   fi
 
-  # Firmware/model often also leaks in the router's own decrypted HTTP/UPnP traffic.
+  # Context: other WPS-identified devices in the capture (neighbors / upstream gear).
+  if [ -n "$wps_all" ] && [ "$wps_all" != "$wps_tgt" ]; then
+    section "other WPS device identities in this capture (neighbors / upstream)"
+    { printf '%s\n' "$hdr"; printf '%s\n' "$wps_all"; } | md_table_or_tsv
+  fi
+
+  # Full LAN banner sweep — fingerprints the router AND other local devices.
   local banners
-  # LAN sources only (RFC1918) so the router's own UPnP/HTTP banner — e.g.
-  # "ipos/7.0 UPnP/1.0 TL-WR841N/9.0" — and local devices show, not every external
-  # web server the client browsed.
   banners="$(tsd -Y "$(bssid_filter) && (http.server || http.user_agent)" \
      -T fields -E occurrence=f -e ip.src -e http.server -e http.user_agent 2>/dev/null \
      | awk -F'\t' 'tolower($2 $3)!="" && $1 ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/' | sort -u | head -n 20)"
   if [ -n "$banners" ]; then
-    section "identity from decrypted HTTP/UPnP banners"
-    { printf 'Source IP\tHTTP Server\tUser-Agent\n'; printf '%s\n' "$banners"; } | md_table_or_tsv
+    section "all decrypted HTTP/UPnP banners (LAN devices)"
+    printf '%s\n' "$banners" | tcol $'Source IP\tHTTP Server\tUser-Agent'
   fi
 }
 
