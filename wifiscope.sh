@@ -1636,31 +1636,92 @@ report() {
   secrets_label="redacted"; [ "${WIFISCOPE_REPORT_SECRETS:-0}" = 1 ] && secrets_label="included"
   decrypt_label="no"; [ "${#DEC[@]}" -gt 0 ] && decrypt_label="yes"
 
-  # Collect each evidence family once.  Event tables are bounded, while counts
-  # and unique inventories always use the complete capture.
-  local frame_stats capture_bytes capture_hash truncated_count retry_count
-  frame_stats="$(tq -T fields -E occurrence=f -e frame.number -e frame.time_epoch -e frame.time -e frame.cap_len -e frame.len \
-    | awk -F'\t' 'NR==1{first=$2;firstt=$3} {n++;last=$2;lastt=$3;cap+=$4;wire+=$5;if($4<$5)tr++}
-        END{if(n)printf "%d\t%s\t%s\t%.3f\t%d\t%d\t%d",n,firstt,lastt,last-first,cap,wire,tr+0}')"
-  capture_bytes="$(wc -c < "$PCAP" | tr -d ' ')"; capture_hash="$(sha256_file)"
-  truncated_count="$(printf '%s' "$frame_stats" | awk -F'\t' '{print $7+0}')"
-  retry_count="$(tq -Y "wlan.fc.retry==1 && $(bssid_filter)" -T fields -e frame.number | grep -c .)"
+  # Collect each evidence family once.  Every INDEPENDENT tshark pass is launched
+  # concurrently to a temp file; on a multi-core box this turns ~20 sequential
+  # full-capture scans into min(passes,cores) waves. The queries are unchanged, so
+  # the assembled report is byte-identical to the sequential version — only the
+  # cheap AWK/bash post-processing runs after the wait.
+  local report_secrets has_gps=0 has_tk=0 D
+  report_secrets="${WIFISCOPE_REPORT_SECRETS:-0}"
+  tshark_has_field ppi_gps.lat      && has_gps=1   # warm the -G fields cache once,
+  tshark_has_field wlan.analysis.tk && has_tk=1    # so the parallel jobs don't re-run it
+  D="$(mktemp -d)"
 
-  local beacon_rows security_rows wps_rows oui_rows gps_rows verdict _bcn _akms _priv _wpa1
-  # ONE beacon pass feeds identity, security, OUI, and the crypto verdict (was seven
-  # separate re-dissections). Aggregator '|' (not the default ',') keeps a field's own
-  # commas — vendor strings, SSID text — intact while multi-value fields like
-  # wlan.rsn.akms.type (one entry per AKM suite) stay splittable. Taking the first
-  # '|'-token per field reproduces tshark's -E occurrence=f exactly.
-  #  1 time 2 bssid 3 vendor 4 ssid 5 ds-ch 6 ht-ch 7 freq 8 dbm | 9 privacy
-  #  10 gcs 11 pcs 12 akms 13 mfpc 14 mfpr | 15 oui-vendor 16 wpa1.version
-  _bcn="$(tq -Y "$(beacons_of_target)" -T fields -E aggregator='|' \
+  { tq -T fields -E occurrence=f -e frame.number -e frame.time_epoch -e frame.time -e frame.cap_len -e frame.len \
+      | awk -F'\t' 'NR==1{first=$2;firstt=$3} {n++;last=$2;lastt=$3;cap+=$4;wire+=$5;if($4<$5)tr++}
+          END{if(n)printf "%d\t%s\t%s\t%.3f\t%d\t%d\t%d",n,firstt,lastt,last-first,cap,wire,tr+0}'; } > "$D/frame_stats" &
+  { tq -Y "wlan.fc.retry==1 && $(bssid_filter)" -T fields -e frame.number | grep -c .; } > "$D/retry" &
+  { tq -Y "$(beacons_of_target)" -T fields -E aggregator='|' \
       -e frame.time -e wlan.bssid -e wlan.bssid_resolved -e wlan.ssid \
       -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \
       -e radiotap.channel.freq -e radiotap.dbm_antsignal \
       -e wlan.fixed.capabilities.privacy -e wlan.rsn.gcs.type -e wlan.rsn.pcs.type \
       -e wlan.rsn.akms.type -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr \
-      -e wlan.bssid.oui_resolved -e wlan.wfa.ie.wpa.version)"
+      -e wlan.bssid.oui_resolved -e wlan.wfa.ie.wpa.version; } > "$D/bcn" &
+  { tq -Y "$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version)" \
+      -T fields -E occurrence=f -e frame.number -e wlan.bssid -e wps.manufacturer \
+      -e wps.model_name -e wps.model_number -e wps.device_name -e wps.serial_number \
+      -e wps.os_version | sort -u; } > "$D/wps" &
+  [ "$has_gps" = 1 ] && { tq -Y "ppi_gps.lat && ppi_gps.lon && $(beacons_of_target)" -T fields -E occurrence=f \
+      -e frame.time -e wlan.bssid -e ppi_gps.lat -e ppi_gps.lon -e ppi_gps.alt \
+      -e ppi_gps.eph -e ppi.80211-common.dbm.antsignal | head -n "$row_limit"; } > "$D/gps" &
+  { tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f \
+      -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
+      -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
+      -e wlan_rsna_eapol.keydes.key_info; } > "$D/eapol" &
+  { tq -Y "$(bssid_filter) && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)" \
+      -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.fc.type_subtype \
+      -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
+    | awk -F'\t' '$7!="" || ($8!="" && $8 !~ /^0*$/)' | sort -u; } > "$D/pmkid" &
+  { tqd -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)" -T fields -e frame.number | grep -c .; } > "$D/deccount" &
+  { tqd -Y "$(bssid_filter) && (dhcp || arp || (icmpv6 && icmpv6.opt.linkaddr) || nbns || mdns || llmnr || dns.qry.name || dns.resp.name || http.user_agent || http.server || ssh.protocol)" \
+      -T fields -E occurrence=f \
+      -e frame.number -e _ws.col.protocol \
+      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
+      -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname -e dhcp.option.vendor_class_id \
+      -e arp.opcode -e arp.src.proto_ipv4 -e arp.src.hw_mac -e arp.dst.proto_ipv4 -e arp.dst.hw_mac \
+      -e ipv6.src -e icmpv6.opt.linkaddr -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address \
+      -e ip.src -e ip.dst -e nbns.name -e dns.resp.name -e dns.qry.name -e dns.a -e dns.aaaa \
+      -e http.user_agent -e http.server -e ssh.protocol; } > "$D/l3" &
+  { tq -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid; } > "$D/st_assoc" &
+  { tq -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid; } > "$D/st_up" &
+  { tq -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.da -e wlan.bssid; } > "$D/st_down" &
+  { tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {0,1,2,3,11}" -T fields -E occurrence=f \
+      -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
+      -e wlan.bssid -e wlan.fixed.status_code -e wlan.fixed.aid; } > "$D/assoc" &
+  { tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {10,12}" -T fields -E occurrence=f \
+      -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
+      -e wlan.bssid -e wlan.fixed.reason_code -e radiotap.dbm_antsignal; } > "$D/action" &
+  { tq -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -E occurrence=f \
+      -e frame.number -e frame.time -e wlan.ta -e wlan.ra -e wlan.sa -e wlan.da | head -n "$row_limit"; } > "$D/wds" &
+  { tq -Y 'wlan.fc.type_subtype==4 && wlan.ssid!=""' -T fields -E occurrence=f \
+      -e wlan.sa -e wlan.ssid | dessid 2 | sort -u; } > "$D/probe" &
+  [ "$has_tk" = 1 ] && { tqd -Y "$(bssid_filter) && (wlan.analysis.kck || wlan.analysis.kek || wlan.analysis.tk)" \
+      -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.bssid -e wlan.staa \
+      -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
+      -e wlan.analysis.pmk -e wlan.analysis.kck -e wlan.analysis.kek -e wlan.analysis.tk \
+      | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show)for(i=7;i<=10;i++)if($i!="")$i="REDACTED";print}' | sort -u; } > "$D/keyanalysis" &
+  { tqd -Y "$(bssid_filter) && eapol && wlan_rsna_eapol.keydes.msgnr==3 && (wlan.rsn.ie.gtk_kde.gtk || wlan.rsn.ie.igtk.kde.igtk || wlan.rsn.ie.bigtk_kde.bigtk)" \
+      -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.sa -e wlan.da \
+      -e wlan.bssid -e eapol.keydes.replay_counter -e wlan.rsn.ie.gtk_kde.key_id \
+      -e wlan.rsn.ie.gtk_kde.tx -e wlan.rsn.ie.gtk_kde.gtk \
+      -e wlan.rsn.ie.igtk.kde.keyid -e wlan.rsn.ie.igtk.kde.ipn -e wlan.rsn.ie.igtk.kde.igtk \
+      -e wlan.rsn.ie.bigtk_kde.key_id -e wlan.rsn.ie.bigtk_kde.bipn -e wlan.rsn.ie.bigtk_kde.bigtk \
+    | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show){if($9!="")$9="REDACTED";if($12!="")$12="REDACTED";if($15!="")$15="REDACTED"}print}' | sort -u; } > "$D/gtk" &
+  { tq -q -z io,phs; } > "$D/phs_plain" &
+  { tqd -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp; } > "$D/l3stats" &
+  wait
+
+  # ---- assemble from the completed passes (cheap AWK/bash only, no more tshark) ----
+  local frame_stats capture_bytes capture_hash truncated_count retry_count phs_plain l3stats
+  frame_stats="$(cat "$D/frame_stats")"
+  capture_bytes="$(wc -c < "$PCAP" | tr -d ' ')"; capture_hash="$(sha256_file)"
+  truncated_count="$(printf '%s' "$frame_stats" | awk -F'\t' '{print $7+0}')"
+  retry_count="$(cat "$D/retry")"
+  phs_plain="$(cat "$D/phs_plain")"; l3stats="$(cat "$D/l3stats")"
+
+  local beacon_rows security_rows wps_rows oui_rows gps_rows verdict _bcn _akms _priv _wpa1
+  _bcn="$(cat "$D/bcn")"
   beacon_rows="$(printf '%s\n' "$_bcn" | dessid 4 \
     | awk -F'\t' -v OFS='\t' '
       {for(i=1;i<=8;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)}
@@ -1671,61 +1732,26 @@ report() {
           n[b]?sprintf("%.1f",sum[b]/n[b]):"",n[b]?lo[b]:"",n[b]?hi[b]:"",n[b]+0}' | sort)"
   security_rows="$(printf '%s\n' "$_bcn" \
     | awk -F'\t' -v OFS='\t' '{for(i=1;i<=NF;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)} print $2,$9,$10,$11,$12,$13,$14}' | sort -u | grep .)"
-  wps_rows="$(tq -Y "$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version)" \
-      -T fields -E occurrence=f -e frame.number -e wlan.bssid -e wps.manufacturer \
-      -e wps.model_name -e wps.model_number -e wps.device_name -e wps.serial_number \
-      -e wps.os_version | sort -u)"
+  wps_rows="$(cat "$D/wps")"
   oui_rows="$(printf '%s\n' "$_bcn" \
     | awk -F'\t' -v OFS='\t' '{for(i=1;i<=NF;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)} print $2,$3,$15}' | sort -u)"
-  gps_rows=""
-  if tshark_has_field ppi_gps.lat; then
-    gps_rows="$(tq -Y "ppi_gps.lat && ppi_gps.lon && $(beacons_of_target)" -T fields -E occurrence=f \
-      -e frame.time -e wlan.bssid -e ppi_gps.lat -e ppi_gps.lon -e ppi_gps.alt \
-      -e ppi_gps.eph -e ppi.80211-common.dbm.antsignal | head -n "$row_limit")"
-  fi
-  # Verdict reads the SAME beacon buffer: all AKM suites (split on '|'), the privacy
-  # bit, and whether a WPA1 vendor IE was present — fed straight to classify_akm.
+  gps_rows="$([ -f "$D/gps" ] && cat "$D/gps")"
   _akms="$(printf '%s\n' "$_bcn" | cut -f12 | tr '|' '\n' | tr -d ' ' | sort -u | grep .)"
   _priv="$(printf '%s\n' "$_bcn" | cut -f9  | tr '|' '\n' | tr -d ' ' | sort -u | grep -m1 1)"
   _wpa1="$(printf '%s\n' "$_bcn" | awk -F'\t' '$16!=""{print $2; exit}')"
   verdict="$(printf '%s\n' "$_akms" | classify_akm "$_priv" "$_wpa1" | cut -f2)"
 
   local eapol_rows hs_rows pmkid_rows pmkid_count m3_count _eapol
-  # ONE eapol pass feeds the frame table, the per-station handshake mask, the M3
-  # count, and the station-inventory EAPOL contribution (all shared the filter).
-  _eapol="$(tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f \
-      -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
-      -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
-      -e wlan_rsna_eapol.keydes.key_info)"
-  # Collapse identical retransmissions (same sa/da/bssid/msg/replay/key-info): a
-  # merged capture records each handshake frame several times, so the raw table hid
-  # the two real handshakes behind ~80 duplicate rows. Keep the first frame#/time and
-  # append a "Copies" count.
+  _eapol="$(cat "$D/eapol")"
   eapol_rows="$(printf '%s\n' "$_eapol" | grep . | _collapse 3,4,5,6,7,8 8 | head -n "$row_limit")"
   hs_rows="$(printf '%s\n' "$_eapol" | awk -F'\t' -v OFS='\t' '$1!=""{print $3,$4,$5,$6}' | _hs_mask)"
-  pmkid_rows="$(tq -Y "$(bssid_filter) && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)" \
-      -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.fc.type_subtype \
-      -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
-    | awk -F'\t' '$7!="" || ($8!="" && $8 !~ /^0*$/)' | sort -u)"
+  pmkid_rows="$(cat "$D/pmkid")"
   pmkid_count="$(printf '%s\n' "$pmkid_rows" | grep -c '[^[:space:]]')"
   m3_count="$(printf '%s\n' "$_eapol" | awk -F'\t' '$6=="3"{n++}END{print n+0}')"
 
   local decrypt_count dhcp_rows arp_rows nd_rows names_rows dns_rows software_rows _l3
-  decrypt_count="$(tqd -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)" -T fields -e frame.number | grep -c .)"
-  # ONE decrypt pass feeds all six L3/name/service tables below. Each tqd pass
-  # re-dissects (and re-decrypts) the whole capture, so collapsing six passes into
-  # one — then routing rows by protocol/field in AWK — is the biggest report saving.
-  # Fields: 1 frame  2 proto | dhcp 3-9 | arp 10-14 | nd 15-18 | ip.src/dst 19-20
-  #         nbns 21  dns.resp 22  dns.qry 23  dns.a 24  dns.aaaa 25 | http/ssh 26-28
-  _l3="$(tqd -Y "$(bssid_filter) && (dhcp || arp || (icmpv6 && icmpv6.opt.linkaddr) || nbns || mdns || llmnr || dns.qry.name || dns.resp.name || http.user_agent || http.server || ssh.protocol)" \
-      -T fields -E occurrence=f \
-      -e frame.number -e _ws.col.protocol \
-      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-      -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname -e dhcp.option.vendor_class_id \
-      -e arp.opcode -e arp.src.proto_ipv4 -e arp.src.hw_mac -e arp.dst.proto_ipv4 -e arp.dst.hw_mac \
-      -e ipv6.src -e icmpv6.opt.linkaddr -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address \
-      -e ip.src -e ip.dst -e nbns.name -e dns.resp.name -e dns.qry.name -e dns.a -e dns.aaaa \
-      -e http.user_agent -e http.server -e ssh.protocol)"
+  decrypt_count="$(cat "$D/deccount")"
+  _l3="$(cat "$D/l3")"
   dhcp_rows="$(printf '%s\n' "$_l3"     | awk -F'\t' -v OFS='\t' 'tolower($2)~/dhcp|bootp/{print $1,$3,$4,$5,$6,$7,$8,$9}'    | sort -u | grep .)"
   arp_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' 'tolower($2)~/arp/{print $1,$10,$11,$12,$13,$14}'            | sort -u | grep .)"
   nd_rows="$(printf '%s\n' "$_l3"       | awk -F'\t' -v OFS='\t' '$16!=""{print $1,$15,$16,$17,$18}'                          | sort -u | grep .)"
@@ -1735,29 +1761,21 @@ report() {
 
   local station_rows assoc_rows action_rows wds_rows probe_rows
   station_rows="$({
-      tq -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"association"}'
+      awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"association"}' "$D/st_assoc"
       printf '%s\n' "$_eapol" | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}$1!=""{sa=tolower($3);da=tolower($4);b=tolower($5);s=(sa in AP)?da:sa;if(s&&b)print s,b,"EAPOL"}'
-      tq -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"uplink data"}'
-      tq -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.da -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"downlink data"}'
+      awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"uplink data"}' "$D/st_up"
+      awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"downlink data"}' "$D/st_down"
     } | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
          BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
          {c=tolower($1); if(c=="" || c in AP || tolower(substr(c,2,1)) ~ /[13579bdf]/)next;
           k=c SUBSEP tolower($2); if(!seen[k SUBSEP $3]++){ev[k]=ev[k] (ev[k]?", ":"") $3}}
          END{for(k in ev){split(k,p,SUBSEP);print p[1],p[2],ev[k]}}' | sort)"
-  # Collapse retransmissions: key on the meaningful tuple (not frame#/time/RSSI).
-  assoc_rows="$(tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {0,1,2,3,11}" -T fields -E occurrence=f \
-      -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
-      -e wlan.bssid -e wlan.fixed.status_code -e wlan.fixed.aid | grep . | _collapse 3,4,5,6,7,8 8 | head -n "$row_limit")"
-  action_rows="$(tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {10,12}" -T fields -E occurrence=f \
-      -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
-      -e wlan.bssid -e wlan.fixed.reason_code -e radiotap.dbm_antsignal | grep . | _collapse 3,4,5,6,7 8 | head -n "$row_limit")"
-  wds_rows="$(tq -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -E occurrence=f \
-      -e frame.number -e frame.time -e wlan.ta -e wlan.ra -e wlan.sa -e wlan.da | head -n "$row_limit")"
-  probe_rows="$(tq -Y 'wlan.fc.type_subtype==4 && wlan.ssid!=""' -T fields -E occurrence=f \
-      -e wlan.sa -e wlan.ssid | dessid 2 | sort -u)"
+  assoc_rows="$(grep . "$D/assoc" | _collapse 3,4,5,6,7,8 8 | head -n "$row_limit")"
+  action_rows="$(grep . "$D/action" | _collapse 3,4,5,6,7 8 | head -n "$row_limit")"
+  wds_rows="$(cat "$D/wds")"
+  probe_rows="$(cat "$D/probe")"
 
-  local keyring_rows key_analysis_rows gtk_rows gtk_count report_secrets
-  report_secrets="${WIFISCOPE_REPORT_SECRETS:-0}"
+  local keyring_rows key_analysis_rows gtk_rows gtk_count
   keyring_rows=""
   if [ -s "$KEYRING" ]; then
     if [ "$report_secrets" = 1 ]; then
@@ -1766,22 +1784,10 @@ report() {
       keyring_rows="$(awk -F'\t' 'BEGIN{OFS="\t"}$1!=""{n[$1]++}END{for(k in n)print k,n[k]" stored value(s) (redacted)"}' "$KEYRING" | sort)"
     fi
   fi
-  key_analysis_rows=""
-  if tshark_has_field wlan.analysis.tk; then
-    key_analysis_rows="$(tqd -Y "$(bssid_filter) && (wlan.analysis.kck || wlan.analysis.kek || wlan.analysis.tk)" \
-      -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.bssid -e wlan.staa \
-      -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
-      -e wlan.analysis.pmk -e wlan.analysis.kck -e wlan.analysis.kek -e wlan.analysis.tk \
-      | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show)for(i=7;i<=10;i++)if($i!="")$i="REDACTED";print}' | sort -u)"
-  fi
-  gtk_rows="$(tqd -Y "$(bssid_filter) && eapol && wlan_rsna_eapol.keydes.msgnr==3 && (wlan.rsn.ie.gtk_kde.gtk || wlan.rsn.ie.igtk.kde.igtk || wlan.rsn.ie.bigtk_kde.bigtk)" \
-      -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.sa -e wlan.da \
-      -e wlan.bssid -e eapol.keydes.replay_counter -e wlan.rsn.ie.gtk_kde.key_id \
-      -e wlan.rsn.ie.gtk_kde.tx -e wlan.rsn.ie.gtk_kde.gtk \
-      -e wlan.rsn.ie.igtk.kde.keyid -e wlan.rsn.ie.igtk.kde.ipn -e wlan.rsn.ie.igtk.kde.igtk \
-      -e wlan.rsn.ie.bigtk_kde.key_id -e wlan.rsn.ie.bigtk_kde.bipn -e wlan.rsn.ie.bigtk_kde.bigtk \
-    | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show){if($9!="")$9="REDACTED";if($12!="")$12="REDACTED";if($15!="")$15="REDACTED"}print}' | sort -u)"
+  key_analysis_rows="$([ -f "$D/keyanalysis" ] && cat "$D/keyanalysis")"
+  gtk_rows="$(cat "$D/gtk")"
   gtk_count="$(printf '%s\n' "$gtk_rows" | grep -c '[^[:space:]]')"
+  rm -rf "$D"
 
   local gateway gateway_mac handshake_good station_count wds_count
   gateway="$(printf '%s\n' "$dhcp_rows" | awk -F'\t' '$6!=""{print $6;exit}')"
@@ -1874,7 +1880,7 @@ KEYS_TMPL
     echo
     echo '### Protocol hierarchy before decryption'
     echo
-    echo '```text'; tq -q -z io,phs; echo '```'
+    echo '```text'; printf '%s\n' "$phs_plain"; echo '```'
     report_command 0 '' -q -z io,phs
 
     echo; echo '## 2. Router identity, band, channel, frequency, and signal'
@@ -2027,7 +2033,6 @@ KEYS_TMPL
     # One decrypt pass emits all four statistics tables (tshark accepts repeated
     # -z), instead of re-dissecting the whole capture four times.
     echo; echo '### Decrypted L3 statistics (protocol hierarchy, IP endpoints, TCP/UDP conversations)'
-    local l3stats; l3stats="$(tqd -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp)"
     if printf '%s' "$l3stats" | grep -q '[^[:space:]]'; then
       echo '```text'; printf '%s\n' "$l3stats"; echo '```'
       report_command 1 '' -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp
