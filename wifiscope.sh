@@ -767,9 +767,11 @@ md_table_or_tsv() { if command -v column >/dev/null 2>&1; then column -t -s $'\t
 #   empty data stream prints a dim "(none observed)" instead of a lonely header, so
 #   a section never reads as broken. Colorization still happens later via paint().
 tcol() {
-  local header="$1" body; body="$(cat)"
+  local header="$1" body n; body="$(cat)"
   if printf '%s' "$body" | grep -q '[^[:space:]]'; then
+    n="$(printf '%s\n' "$body" | grep -c '[^[:space:]]')"
     { printf '%s\n' "$header"; printf '%s\n' "$body"; } | md_table_or_tsv
+    printf '%s  — %d row%s%s\n' "$C_DIM" "$n" "$([ "$n" = 1 ] || printf s)" "$C_RESET"
   else
     printf '%s  (none observed)%s\n' "$C_DIM" "$C_RESET"
   fi
