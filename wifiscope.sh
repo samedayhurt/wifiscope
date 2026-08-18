@@ -764,9 +764,16 @@ md_table_or_tsv() { if command -v column >/dev/null 2>&1; then column -t -s $'\t
 # tcol HEADER: label + align a raw TSV data stream so each column is discernible
 #   and the block is clean to copy-paste. Prints the tab-separated HEADER first,
 #   then aligns everything on tabs (falls back to plain TSV without `column`). An
-#   empty data stream prints just the header, so a section never looks "broken".
-#   Colorization still happens later via paint(); the alignment survives it.
-tcol() { { printf '%s\n' "$1"; cat; } | md_table_or_tsv; }
+#   empty data stream prints a dim "(none observed)" instead of a lonely header, so
+#   a section never reads as broken. Colorization still happens later via paint().
+tcol() {
+  local header="$1" body; body="$(cat)"
+  if printf '%s' "$body" | grep -q '[^[:space:]]'; then
+    { printf '%s\n' "$header"; printf '%s\n' "$body"; } | md_table_or_tsv
+  else
+    printf '%s  (none observed)%s\n' "$C_DIM" "$C_RESET"
+  fi
+}
 
 # drop_group: filter out group-addressed (broadcast/multicast) MACs from a stream
 #   of one-MAC-per-line. The I/G bit is the low bit of the first octet, so a MAC is
