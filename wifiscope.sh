@@ -120,13 +120,21 @@ banner() {
 print_tshark_command() {
   local decrypt="$1" redact="${2:-0}"; shift 2
   local -a argv=(-r "$PCAP")
-  [ "$decrypt" = 1 ] && argv+=("${DEC[@]}")
+  # In report context REPORT_KEYSET_TOKEN holds a placeholder (e.g. "${KEYS[@]}")
+  # that stands in for the whole decryption key set, so each of the ~13 decrypting
+  # reproduce blocks references the keys once instead of re-printing every record.
+  if [ "$decrypt" = 1 ]; then
+    if [ -n "${REPORT_KEYSET_TOKEN:-}" ]; then argv+=("$REPORT_KEYSET_TOKEN"); else argv+=("${DEC[@]}"); fi
+  fi
   argv+=("$@")
 
   printf '$ tshark'
   local i=0 a v q chunk
   while [ "$i" -lt "${#argv[@]}" ]; do
     a="${argv[$i]}"; i=$((i+1)); chunk=""
+    if [ -n "${REPORT_KEYSET_TOKEN:-}" ] && [ "$a" = "$REPORT_KEYSET_TOKEN" ]; then
+      printf ' \\\n  %s' "$a"; continue   # emit the key-set placeholder verbatim
+    fi
     case "$a" in
       -r|-o|-Y|-T|-E|-e|-z|-N|-c|-a)
         if [ "$i" -lt "${#argv[@]}" ]; then
@@ -691,15 +699,53 @@ crypto() {
   printf '%s🔒 verdict:%s %s%s%s\n' "$C_B" "$C_RESET" "$col" "$txt" "$C_RESET"
 }
 
-# hardware: pull make/model out of the WPS information element in beacons.
-#   WHY: APs advertise Manufacturer / Model Name / Model Number in WPS. These
-#        map directly to "make" and "model" questions.
+# hardware: identify the router — make / model / model# / device / serial /
+#   firmware — primarily from the WPS information element (beacons AND probe
+#   responses; TP-Link and many others only put the full identity in probe
+#   responses, not beacons). WHY the extra sources: some APs advertise an EMPTY
+#   WPS IE (no identity at all), so a bare WPS query returns a blank wall. When the
+#   target has no WPS identity we (a) say so explicitly, (b) list the WPS identities
+#   that DO exist in the capture (neighbors), and (c) sweep decrypted HTTP/UPnP
+#   banners, where router firmware/model frequently leaks from the admin page.
 hardware() {
-  section "🏷️  make / model (WPS) for $SSID"
-  ts -Y "(wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version) && $(bssid_filter)" -T fields \
-     -e wlan.bssid -e wps.manufacturer -e wps.model_name \
-     -e wps.model_number -e wps.device_name -e wps.serial_number -e wps.os_version | sort -u
+  local hdr=$'BSSID\tMake\tModel\tModel #\tDevice\tSerial\tFirmware (WPS OS)'
+  local wps_all wps_tgt
+  # Pull every populated WPS identity in the capture once, then split target vs rest.
+  wps_all="$(ts -Y '(wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version)' \
+     -T fields -E occurrence=f -e wlan.bssid -e wps.manufacturer -e wps.model_name \
+     -e wps.model_number -e wps.device_name -e wps.serial_number -e wps.os_version \
+     | awk -F'\t' 'tolower($2 $3 $4 $5 $6 $7)!=""' | sort -u)"
+  local -a tgt=(); [ "${#TGT_BSSIDS[@]}" -gt 0 ] && tgt=("${TGT_BSSIDS[@]}")
+  wps_tgt="$(printf '%s\n' "$wps_all" | awk -F'\t' -v t="${tgt[*]}" 'BEGIN{n=split(tolower(t),a," ");for(i=1;i<=n;i++)T[a[i]]=1} (tolower($1) in T)')"
+
+  section "🏷️  make / model / firmware for $SSID (WPS)"
+  if [ -n "$wps_tgt" ]; then
+    { printf '%s\n' "$hdr"; printf '%s\n' "$wps_tgt"; } | md_table_or_tsv
+  else
+    note "$SSID advertised no WPS identity (its WPS IE is empty or absent)"
+    if [ -n "$wps_all" ]; then
+      section "WPS identities seen ELSEWHERE in this capture (neighbors — NOT $SSID)"
+      { printf '%s\n' "$hdr"; printf '%s\n' "$wps_all"; } | md_table_or_tsv
+    fi
+  fi
+
+  # Firmware/model often also leaks in the router's own decrypted HTTP/UPnP traffic.
+  local banners
+  # LAN sources only (RFC1918) so the router's own UPnP/HTTP banner — e.g.
+  # "ipos/7.0 UPnP/1.0 TL-WR841N/9.0" — and local devices show, not every external
+  # web server the client browsed.
+  banners="$(tsd -Y "$(bssid_filter) && (http.server || http.user_agent)" \
+     -T fields -E occurrence=f -e ip.src -e http.server -e http.user_agent 2>/dev/null \
+     | awk -F'\t' 'tolower($2 $3)!="" && $1 ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/' | sort -u | head -n 20)"
+  if [ -n "$banners" ]; then
+    section "identity from decrypted HTTP/UPnP banners"
+    { printf 'Source IP\tHTTP Server\tUser-Agent\n'; printf '%s\n' "$banners"; } | md_table_or_tsv
+  fi
 }
+
+# md_table_or_tsv: align a header+rows TSV with `column` when available, else pass
+#   through — a terminal convenience shared by the identity view.
+md_table_or_tsv() { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
 
 # drop_group: filter out group-addressed (broadcast/multicast) MACs from a stream
 #   of one-MAC-per-line. The I/G bit is the low bit of the first octet, so a MAC is
@@ -750,13 +796,11 @@ clients() {
   station_macs
 }
 
-# handshake_summary: station<TAB>bssid<TAB>message-mask<TAB>recoverable.
-#   A lone M1 is evidence that an AP tried to start a handshake, not evidence of
-#   a recovered PTK.  (M1+M2) or (M2+M3) supplies a crackable/derivable context.
-handshake_summary() {
-  ts -Y "eapol && $(bssid_filter)" -T fields \
-     -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr \
-   | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
+# _hs_mask: reads  sa<TAB>da<TAB>bssid<TAB>msgnr  on stdin and prints the
+#   per-station handshake summary. Split out so report() can feed it the shared
+#   EAPOL buffer instead of running another tshark pass.
+_hs_mask() {
+  awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
        BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
        { if($4=="")next; sa=tolower($1); da=tolower($2); b=tolower($3);
          sta=(sa in AP)?da:sa; if(sta==""||b=="")next; M[sta SUBSEP b SUBSEP $4]=1 }
@@ -766,6 +810,28 @@ handshake_summary() {
               good=(((p[1] SUBSEP p[2] SUBSEP 1) in M)&&((p[1] SUBSEP p[2] SUBSEP 2) in M)) ||
                    (((p[1] SUBSEP p[2] SUBSEP 2) in M)&&((p[1] SUBSEP p[2] SUBSEP 3) in M));
               print p[1],p[2],mask,(good?"YES":"no") } }' | sort
+}
+
+# handshake_summary: station<TAB>bssid<TAB>message-mask<TAB>recoverable.
+#   A lone M1 is evidence that an AP tried to start a handshake, not evidence of
+#   a recovered PTK.  (M1+M2) or (M2+M3) supplies a crackable/derivable context.
+handshake_summary() {
+  ts -Y "eapol && $(bssid_filter)" -T fields \
+     -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr | _hs_mask
+}
+
+# _collapse KEYCOLS NFIELDS: read a TSV, dedupe rows whose KEYCOLS (comma-listed,
+#   1-based) match, keep the FIRST occurrence's fields, and append a trailing
+#   "copies" count. Used to fold the many identical retransmissions a merged
+#   capture records for each management/EAPOL frame into one legible row.
+_collapse() {
+  awk -F'\t' -v OFS='\t' -v kc="$1" -v nf="$2" '
+    BEGIN{n=split(kc,c,",")}
+    {k=""; for(i=1;i<=n;i++) k=k SUBSEP $(c[i]);
+     if(!(k in seen)){seen[k]=1; order[++m]=k; for(i=1;i<=nf;i++) cell[k,i]=$i}
+     cnt[k]++}
+    END{for(j=1;j<=m;j++){k=order[j]; line=cell[k,1];
+          for(i=2;i<=nf;i++) line=line OFS cell[k,i]; print line OFS cnt[k]}}'
 }
 
 # keys: count PSKs, recoverable PTK contexts, and GTKs — and explain each number.
@@ -1513,6 +1579,10 @@ report() {
   local out="${1:-wifiscope_${SSID:-report}.md}" mapout="${1:-wifiscope_${SSID:-report}.md}"
   mapout="${mapout%.md}.drawio"
   local generated row_limit secrets_label decrypt_label
+  # Dynamically scoped so report_command -> print_tshark_command renders the key set
+  # as a single "${KEYS[@]}" placeholder; unset everywhere else (interactive teaching
+  # output keeps showing the real per-key records).
+  local REPORT_KEYSET_TOKEN='"${KEYS[@]}"'
   generated="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
   row_limit="${WIFISCOPE_REPORT_ROW_LIMIT:-500}"
   secrets_label="redacted"; [ "${WIFISCOPE_REPORT_SECRETS:-0}" = 1 ] && secrets_label="included"
@@ -1528,47 +1598,69 @@ report() {
   truncated_count="$(printf '%s' "$frame_stats" | awk -F'\t' '{print $7+0}')"
   retry_count="$(tq -Y "wlan.fc.retry==1 && $(bssid_filter)" -T fields -e frame.number | grep -c .)"
 
-  local beacon_rows security_rows wps_rows oui_rows gps_rows verdict
-  beacon_rows="$(tq -Y "$(beacons_of_target)" -T fields -E occurrence=f \
+  local beacon_rows security_rows wps_rows oui_rows gps_rows verdict _bcn _akms _priv _wpa1
+  # ONE beacon pass feeds identity, security, OUI, and the crypto verdict (was seven
+  # separate re-dissections). Aggregator '|' (not the default ',') keeps a field's own
+  # commas — vendor strings, SSID text — intact while multi-value fields like
+  # wlan.rsn.akms.type (one entry per AKM suite) stay splittable. Taking the first
+  # '|'-token per field reproduces tshark's -E occurrence=f exactly.
+  #  1 time 2 bssid 3 vendor 4 ssid 5 ds-ch 6 ht-ch 7 freq 8 dbm | 9 privacy
+  #  10 gcs 11 pcs 12 akms 13 mfpc 14 mfpr | 15 oui-vendor 16 wpa1.version
+  _bcn="$(tq -Y "$(beacons_of_target)" -T fields -E aggregator='|' \
       -e frame.time -e wlan.bssid -e wlan.bssid_resolved -e wlan.ssid \
       -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \
-      -e radiotap.channel.freq -e radiotap.dbm_antsignal | dessid 4 \
+      -e radiotap.channel.freq -e radiotap.dbm_antsignal \
+      -e wlan.fixed.capabilities.privacy -e wlan.rsn.gcs.type -e wlan.rsn.pcs.type \
+      -e wlan.rsn.akms.type -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr \
+      -e wlan.bssid.oui_resolved -e wlan.wfa.ie.wpa.version)"
+  beacon_rows="$(printf '%s\n' "$_bcn" | dessid 4 \
     | awk -F'\t' -v OFS='\t' '
-      {b=tolower($2); if(b=="")next; vendor[b]=$3;ssid[b]=$4;c=($5!=""?$5:$6);if(c!="")ch[b]=c;
+      {for(i=1;i<=8;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)}
+       b=tolower($2); if(b=="")next; vendor[b]=$3;ssid[b]=$4;c=($5!=""?$5:$6);if(c!="")ch[b]=c;
        f=$7+0;if(f){freq[b]=f;band[b]=(f>=5925?"6 GHz":(f>=5150?"5 GHz":"2.4 GHz"))}
        if($8!=""){r=$8+0;sum[b]+=r;n[b]++;if(!(b in lo)||r<lo[b])lo[b]=r;if(!(b in hi)||r>hi[b])hi[b]=r}}
       END{for(b in ssid)printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",b,ssid[b],vendor[b],band[b],ch[b],freq[b],
           n[b]?sprintf("%.1f",sum[b]/n[b]):"",n[b]?lo[b]:"",n[b]?hi[b]:"",n[b]+0}' | sort)"
-  security_rows="$(tq -Y "$(beacons_of_target)" -T fields -E occurrence=f \
-      -e wlan.bssid -e wlan.fixed.capabilities.privacy -e wlan.rsn.gcs.type \
-      -e wlan.rsn.pcs.type -e wlan.rsn.akms.type -e wlan.rsn.capabilities.mfpc \
-      -e wlan.rsn.capabilities.mfpr | sort -u | grep .)"
+  security_rows="$(printf '%s\n' "$_bcn" \
+    | awk -F'\t' -v OFS='\t' '{for(i=1;i<=NF;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)} print $2,$9,$10,$11,$12,$13,$14}' | sort -u | grep .)"
   wps_rows="$(tq -Y "$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version)" \
       -T fields -E occurrence=f -e frame.number -e wlan.bssid -e wps.manufacturer \
       -e wps.model_name -e wps.model_number -e wps.device_name -e wps.serial_number \
       -e wps.os_version | sort -u)"
-  oui_rows="$(tq -Y "$(beacons_of_target)" -T fields -E occurrence=f \
-      -e wlan.bssid -e wlan.bssid_resolved -e wlan.bssid.oui_resolved | sort -u)"
+  oui_rows="$(printf '%s\n' "$_bcn" \
+    | awk -F'\t' -v OFS='\t' '{for(i=1;i<=NF;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)} print $2,$3,$15}' | sort -u)"
   gps_rows=""
   if tshark_has_field ppi_gps.lat; then
     gps_rows="$(tq -Y "ppi_gps.lat && ppi_gps.lon && $(beacons_of_target)" -T fields -E occurrence=f \
       -e frame.time -e wlan.bssid -e ppi_gps.lat -e ppi_gps.lon -e ppi_gps.alt \
       -e ppi_gps.eph -e ppi.80211-common.dbm.antsignal | head -n "$row_limit")"
   fi
-  verdict="$(crypto_verdict_text)"
+  # Verdict reads the SAME beacon buffer: all AKM suites (split on '|'), the privacy
+  # bit, and whether a WPA1 vendor IE was present — fed straight to classify_akm.
+  _akms="$(printf '%s\n' "$_bcn" | cut -f12 | tr '|' '\n' | tr -d ' ' | sort -u | grep .)"
+  _priv="$(printf '%s\n' "$_bcn" | cut -f9  | tr '|' '\n' | tr -d ' ' | sort -u | grep -m1 1)"
+  _wpa1="$(printf '%s\n' "$_bcn" | awk -F'\t' '$16!=""{print $2; exit}')"
+  verdict="$(printf '%s\n' "$_akms" | classify_akm "$_priv" "$_wpa1" | cut -f2)"
 
-  local eapol_rows hs_rows pmkid_rows pmkid_count m3_count
-  eapol_rows="$(tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f \
+  local eapol_rows hs_rows pmkid_rows pmkid_count m3_count _eapol
+  # ONE eapol pass feeds the frame table, the per-station handshake mask, the M3
+  # count, and the station-inventory EAPOL contribution (all shared the filter).
+  _eapol="$(tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
       -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
-      -e wlan_rsna_eapol.keydes.key_info | head -n "$row_limit")"
-  hs_rows="$(handshake_summary 2>/dev/null)"
+      -e wlan_rsna_eapol.keydes.key_info)"
+  # Collapse identical retransmissions (same sa/da/bssid/msg/replay/key-info): a
+  # merged capture records each handshake frame several times, so the raw table hid
+  # the two real handshakes behind ~80 duplicate rows. Keep the first frame#/time and
+  # append a "Copies" count.
+  eapol_rows="$(printf '%s\n' "$_eapol" | grep . | _collapse 3,4,5,6,7,8 8 | head -n "$row_limit")"
+  hs_rows="$(printf '%s\n' "$_eapol" | awk -F'\t' -v OFS='\t' '$1!=""{print $3,$4,$5,$6}' | _hs_mask)"
   pmkid_rows="$(tq -Y "$(bssid_filter) && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)" \
       -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.fc.type_subtype \
       -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
     | awk -F'\t' '$7!="" || ($8!="" && $8 !~ /^0*$/)' | sort -u)"
   pmkid_count="$(printf '%s\n' "$pmkid_rows" | grep -c '[^[:space:]]')"
-  m3_count="$(tq -Y "eapol && wlan_rsna_eapol.keydes.msgnr==3 && $(bssid_filter)" -T fields -e frame.number | grep -c .)"
+  m3_count="$(printf '%s\n' "$_eapol" | awk -F'\t' '$6=="3"{n++}END{print n+0}')"
 
   local decrypt_count dhcp_rows arp_rows nd_rows names_rows dns_rows software_rows _l3
   decrypt_count="$(tqd -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)" -T fields -e frame.number | grep -c .)"
@@ -1596,7 +1688,7 @@ report() {
   local station_rows assoc_rows action_rows wds_rows probe_rows
   station_rows="$({
       tq -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"association"}'
-      tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.da -e wlan.bssid | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}{sa=tolower($1);da=tolower($2);b=tolower($3);s=(sa in AP)?da:sa;if(s&&b)print s,b,"EAPOL"}'
+      printf '%s\n' "$_eapol" | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" 'BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}$1!=""{sa=tolower($3);da=tolower($4);b=tolower($5);s=(sa in AP)?da:sa;if(s&&b)print s,b,"EAPOL"}'
       tq -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"uplink data"}'
       tq -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.da -e wlan.bssid | awk -F'\t' 'BEGIN{OFS="\t"}$1&&$2{print tolower($1),tolower($2),"downlink data"}'
     } | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
@@ -1604,12 +1696,13 @@ report() {
          {c=tolower($1); if(c=="" || c in AP || tolower(substr(c,2,1)) ~ /[13579bdf]/)next;
           k=c SUBSEP tolower($2); if(!seen[k SUBSEP $3]++){ev[k]=ev[k] (ev[k]?", ":"") $3}}
          END{for(k in ev){split(k,p,SUBSEP);print p[1],p[2],ev[k]}}' | sort)"
+  # Collapse retransmissions: key on the meaningful tuple (not frame#/time/RSSI).
   assoc_rows="$(tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {0,1,2,3,11}" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
-      -e wlan.bssid -e wlan.fixed.status_code -e wlan.fixed.aid | head -n "$row_limit")"
+      -e wlan.bssid -e wlan.fixed.status_code -e wlan.fixed.aid | grep . | _collapse 3,4,5,6,7,8 8 | head -n "$row_limit")"
   action_rows="$(tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {10,12}" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
-      -e wlan.bssid -e wlan.fixed.reason_code -e radiotap.dbm_antsignal | head -n "$row_limit")"
+      -e wlan.bssid -e wlan.fixed.reason_code -e radiotap.dbm_antsignal | grep . | _collapse 3,4,5,6,7 8 | head -n "$row_limit")"
   wds_rows="$(tq -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.ta -e wlan.ra -e wlan.sa -e wlan.da | head -n "$row_limit")"
   probe_rows="$(tq -Y 'wlan.fc.type_subtype==4 && wlan.ssid!=""' -T fields -E occurrence=f \
@@ -1671,10 +1764,10 @@ report() {
     echo
     echo "Matching diagram: [${mapout##*/}](${mapout##*/})"
     echo
-    echo '<details><summary>Paste once: table helpers used by the commands below</summary>'
+    echo '<details><summary>Paste once: table helpers + key set used by the commands below</summary>'
     echo
+    echo '```bash'
     cat <<'REPORT_HELPERS'
-```bash
 # Align TSV when util-linux `column` is installed; otherwise preserve plain TSV.
 tsv_columns() {
   if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi
@@ -1685,8 +1778,30 @@ table_unique() {
   IFS= read -r header || return 0
   { printf '%s\n' "$header"; LC_ALL=C sort -u; } | tsv_columns
 }
-```
 REPORT_HELPERS
+    # The decrypting reproduce commands below reference the key set once, as
+    # "${KEYS[@]}", instead of repeating every -o record in each block.
+    if [ "${WIFISCOPE_REPORT_SECRETS:-0}" = 1 ] && [ "${#DEC[@]}" -gt 0 ]; then
+      echo '# Decryption key set recovered for this capture:'
+      printf 'KEYS=(\n'
+      local _i=0
+      while [ "$_i" -lt "${#DEC[@]}" ]; do
+        printf '  %s %s\n' "${DEC[$_i]}" "$(shell_quote_human "${DEC[$((_i+1))]}")"
+        _i=$((_i+2))
+      done
+      printf ')\n'
+    else
+      cat <<KEYS_TMPL
+# Decryption key set — fill in from this capture's keyring file
+#   ${PCAP##*/}.keys   (one  type<TAB>value  line per key), e.g.:
+KEYS=(
+  -o wlan.enable_decryption:TRUE
+  -o 'uat:80211_keys:"wpa-pwd","<passphrase>:<SSID>"'
+  # ...one  -o 'uat:80211_keys:"<type>","<value>"'  per keyring entry
+)
+KEYS_TMPL
+    fi
+    echo '```'
     echo '</details>'
     echo
     echo '## Executive summary'
@@ -1756,7 +1871,7 @@ REPORT_HELPERS
 
     echo; echo '## 5. EAPOL handshake and PMKID evidence'
     echo; echo '### EAPOL frames'
-    printf '%s\n' "$eapol_rows" | md_table $'Frame\tTime\tSource\tDestination\tBSSID\tMessage\tReplay counter\tKey info'
+    printf '%s\n' "$eapol_rows" | md_table $'Frame\tTime\tSource\tDestination\tBSSID\tMessage\tReplay counter\tKey info\tCopies'
     echo "_Event table limited to the first $row_limit matching rows; summary below uses the complete capture._"
     report_command 0 "head -n $row_limit | table_rows" -Y "eapol && $(bssid_filter)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e frame.time \
@@ -1830,12 +1945,12 @@ REPORT_HELPERS
     report_command 0 'table_unique' -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e wlan.da -e wlan.bssid
     echo; echo '### Association and authentication events'
-    printf '%s\n' "$assoc_rows" | md_table $'Frame\tTime\tSubtype\tSource\tDestination\tBSSID\tStatus\tAID'
+    printf '%s\n' "$assoc_rows" | md_table $'Frame\tTime\tSubtype\tSource\tDestination\tBSSID\tStatus\tAID\tCopies'
     report_command 0 "head -n $row_limit | table_rows" -Y "$(bssid_filter) && wlan.fc.type_subtype in {0,1,2,3,11}" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e frame.time \
       -e wlan.fc.type_subtype -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.fixed.status_code -e wlan.fixed.aid
     echo; echo '### Deauthentication and disassociation frames'
-    printf '%s\n' "$action_rows" | md_table $'Frame\tTime\tSubtype\tSource\tDestination\tBSSID\tReason\tRSSI dBm'
+    printf '%s\n' "$action_rows" | md_table $'Frame\tTime\tSubtype\tSource\tDestination\tBSSID\tReason\tRSSI dBm\tCopies'
     echo '_These are observed on-air frames. The PCAP alone does not attribute them to an operator._'
     report_command 0 "head -n $row_limit | table_rows" -Y "$(bssid_filter) && wlan.fc.type_subtype in {10,12}" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e frame.time \
