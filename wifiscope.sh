@@ -602,7 +602,8 @@ recon() {
   section "📇 all beacons: bssid / ssid / 2.4ch / 5ch / freq"
   ts -Y 'wlan.fc.type_subtype==8' -T fields \
      -e wlan.bssid -e wlan.ssid -e wlan.ds.current_channel \
-     -e wlan.ht.info.primarychannel -e radiotap.channel.freq | dessid 2 | sort -u
+     -e wlan.ht.info.primarychannel -e radiotap.channel.freq | dessid 2 | sort -u \
+     | tcol $'BSSID\tSSID\t2.4GHz ch\t5GHz ch\tFreq MHz'
 }
 
 # bands: channel + band for each BSSID of the target SSID.
@@ -747,6 +748,13 @@ hardware() {
 #   through — a terminal convenience shared by the identity view.
 md_table_or_tsv() { if command -v column >/dev/null 2>&1; then column -t -s $'\t'; else cat; fi; }
 
+# tcol HEADER: label + align a raw TSV data stream so each column is discernible
+#   and the block is clean to copy-paste. Prints the tab-separated HEADER first,
+#   then aligns everything on tabs (falls back to plain TSV without `column`). An
+#   empty data stream prints just the header, so a section never looks "broken".
+#   Colorization still happens later via paint(); the alignment survives it.
+tcol() { { printf '%s\n' "$1"; cat; } | md_table_or_tsv; }
+
 # drop_group: filter out group-addressed (broadcast/multicast) MACs from a stream
 #   of one-MAC-per-line. The I/G bit is the low bit of the first octet, so a MAC is
 #   group-addressed exactly when the 2nd hex digit is odd (1,3,5,7,9,b,d,f) — e.g.
@@ -791,9 +799,10 @@ station_macs() {
 clients() {
   section "👥 wireless station candidates on $SSID (assoc + data + EAPOL)"
   ts -Y "eapol && $(bssid_filter)" -T fields \
-     -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr
+     -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr \
+     | tcol $'Frame\tSource\tDestination\tBSSID\tEAPOL msg'
   section "distinct client MACs (all sources)"
-  station_macs
+  station_macs | tcol 'Station MAC'
 }
 
 # _hs_mask: reads  sa<TAB>da<TAB>bssid<TAB>msgnr  on stdin and prints the
@@ -882,7 +891,7 @@ topology() {
   # a real backhaul peer is unicast; the I/G bit (2nd hex digit odd) flags a group.
   ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra \
     | awk -F'\t' '$1!="" && $2!="" && tolower(substr($1,2,1)) !~ /[13579bdf]/ && tolower(substr($2,2,1)) !~ /[13579bdf]/' \
-    | sort -u
+    | sort -u | tcol $'Transmitter\tReceiver'
   section "backhaul frame count"
   ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' | wc -l
   note "count physical APs = distinct units in the backhaul (root + each satellite backhaul-STA)"
@@ -897,30 +906,37 @@ hosts() {
   tsd -Y 'arp || ip || ipv6' | wc -l
   section "subnet / gateway (DHCP options 1 & 3)"
   tsd -Y 'dhcp' -T fields \
-      -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u
+      -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u \
+      | tcol $'Assigned IP\tSubnet mask\tRouter\tHostname'
   section "DHCP fingerprint (mac / ip / hostname / vendor-class)"
   tsd -Y 'dhcp' -T fields \
       -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-      -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u
+      -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u \
+      | tcol $'Client MAC\tRequested IP\tAssigned IP\tHostname\tVendor class'
   section "ARP IPv4 <-> MAC"
-  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac | sort -u
+  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac | sort -u \
+      | tcol $'IPv4\tMAC'
   # IPv6 is invisible to ARP; neighbor discovery is its equivalent. The link-layer
   # address option in NS/NA/RS/RA carries IPv6<->MAC, and DHCPv6's DUID-LL carries
   # the client MAC — without these, every IPv6-only host is missed.
   section "IPv6 neighbors (ICMPv6 ND link-layer option)"
   tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields \
       -e ipv6.src -e icmpv6.opt.linkaddr \
-      -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u
+      -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u \
+      | tcol $'IPv6 source\tLink-layer MAC\tNS target\tNA target'
   section "DHCPv6 (client IPv6 / DUID link-layer MAC)"
-  tsd -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll.link_layer_addr | sort -u
+  tsd -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll.link_layer_addr | sort -u \
+      | tcol $'IPv6 source\tDUID link-layer MAC'
   section "hostname sweep (DHCP / NBNS / mDNS / LLMNR)"
   # dns.resp.name (answers) carries the real host.local a device advertises; qry.name
   # is what a device is *looking for*. Include both — the map keys names off resp.name.
   tsd -Y 'dhcp.option.hostname || nbns || mdns || llmnr' -T fields \
-      -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u
+      -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u \
+      | tcol $'Source IP\tDHCP hostname\tNBNS name\tmDNS response\tDNS query'
   section "software versions (HTTP / SSH banners)"
   tsd -Y 'http.user_agent || http.server || ssh.protocol' -T fields \
-      -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u
+      -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u \
+      | tcol $'Source IP\tHTTP User-Agent\tHTTP Server\tSSH protocol'
 }
 
 # pmkid: list RSN PMKID evidence.  PMKIDs are commonly carried in association RSN
@@ -931,7 +947,8 @@ pmkid() {
   ts -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
      -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid \
      -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
-    | awk -F'\t' '$5!="" || ($6!="" && $6 !~ /^0*$/)' | sort -u
+    | awk -F'\t' '$5!="" || ($6!="" && $6 !~ /^0*$/)' | sort -u \
+    | tcol $'Frame\tSource\tDestination\tBSSID\tPMKID AKM\tPMKID'
 }
 
 # export22000: write a hashcat-22000 file to crack with:  hashcat -m 22000 <file>
@@ -963,7 +980,7 @@ export22000() {
 probes() {
   section "🔎 probe requests: client → SSID sought"
   ts -Y 'wlan.fc.type_subtype==4 && wlan.ssid != ""' -T fields -e wlan.sa -e wlan.ssid \
-    | awk -F'\t' 'NF==2 && $2!=""' | dessid 2 | sort -u
+    | awk -F'\t' 'NF==2 && $2!=""' | dessid 2 | sort -u | tcol $'Station\tSSID sought'
 }
 
 # handshakes: per client, which 4-way messages were captured and whether that's
