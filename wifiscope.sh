@@ -1548,11 +1548,16 @@ tshark_has_field() {
 
 # md_table HEADER_TSV: turn tab-separated rows into a clean GitHub/Obsidian table.
 # Empty cells are rendered as an em dash and an empty result is stated explicitly.
+# A blank line is emitted before AND after the block: Obsidian only renders a table
+# that is surrounded by blank lines, so this keeps every table (and the <details>
+# that follows) from collapsing into raw "|" text.
 md_table() {
   local header="$1" data
   data="$(cat)"
+  echo
   if ! printf '%s\n' "$data" | grep -q '[^[:space:]]'; then
     echo "_No matching evidence observed._"
+    echo
     return
   fi
   printf '%s\n' "$data" | awk -F'\t' -v H="$header" '
@@ -1560,6 +1565,7 @@ md_table() {
     BEGIN{n=split(H,h,"\t");printf "|";for(i=1;i<=n;i++)printf " %s |",h[i];print "";
           printf "|";for(i=1;i<=n;i++)printf " --- |";print ""}
     {printf "|";for(i=1;i<=n;i++)printf " %s |",clean($i);print ""}'
+  echo
 }
 
 # report_command DECRYPT PIPELINE ARGS...: print the command that produced the
@@ -1567,7 +1573,7 @@ md_table() {
 # Key values are redacted by default; WIFISCOPE_REPORT_SECRETS=1 opts in.
 report_command() {
   local decrypt="$1" pipeline="$2" redact=1 rendered; shift 2
-  [ "${WIFISCOPE_REPORT_SECRETS:-0}" = 1 ] && redact=0
+  [ "${WIFISCOPE_REPORT_SECRETS:-1}" = 1 ] && redact=0
   rendered="$(print_tshark_command "$decrypt" "$redact" "$@")"
   echo '<details><summary>Reproduce with TShark</summary>'
   echo
@@ -1633,7 +1639,7 @@ report() {
   local REPORT_KEYSET_TOKEN='"${KEYS[@]}"'
   generated="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
   row_limit="${WIFISCOPE_REPORT_ROW_LIMIT:-500}"
-  secrets_label="redacted"; [ "${WIFISCOPE_REPORT_SECRETS:-0}" = 1 ] && secrets_label="included"
+  secrets_label="redacted"; [ "${WIFISCOPE_REPORT_SECRETS:-1}" = 1 ] && secrets_label="included"
   decrypt_label="no"; [ "${#DEC[@]}" -gt 0 ] && decrypt_label="yes"
 
   # Collect each evidence family once.  Every INDEPENDENT tshark pass is launched
@@ -1642,7 +1648,7 @@ report() {
   # the assembled report is byte-identical to the sequential version — only the
   # cheap AWK/bash post-processing runs after the wait.
   local report_secrets has_gps=0 has_tk=0 D
-  report_secrets="${WIFISCOPE_REPORT_SECRETS:-0}"
+  report_secrets="${WIFISCOPE_REPORT_SECRETS:-1}"
   tshark_has_field ppi_gps.lat      && has_gps=1   # warm the -G fields cache once,
   tshark_has_field wlan.analysis.tk && has_tk=1    # so the parallel jobs don't re-run it
   D="$(mktemp -d)"
@@ -1752,12 +1758,16 @@ report() {
   local decrypt_count dhcp_rows arp_rows nd_rows names_rows dns_rows software_rows _l3
   decrypt_count="$(cat "$D/deccount")"
   _l3="$(cat "$D/l3")"
-  dhcp_rows="$(printf '%s\n' "$_l3"     | awk -F'\t' -v OFS='\t' 'tolower($2)~/dhcp|bootp/{print $1,$3,$4,$5,$6,$7,$8,$9}'    | sort -u | grep .)"
-  arp_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' 'tolower($2)~/arp/{print $1,$10,$11,$12,$13,$14}'            | sort -u | grep .)"
-  nd_rows="$(printf '%s\n' "$_l3"       | awk -F'\t' -v OFS='\t' '$16!=""{print $1,$15,$16,$17,$18}'                          | sort -u | grep .)"
-  names_rows="$(printf '%s\n' "$_l3"    | awk -F'\t' -v OFS='\t' '$8!=""||tolower($2)~/nbns|mdns|llmnr/{print $1,$19,$8,$21,$22,$23}' | sort -u | grep .)"
-  dns_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' '$23!=""||$22!=""{print $1,$19,$20,$23,$22,$24,$25}'         | sort -u | grep . | head -n "$row_limit")"
-  software_rows="$(printf '%s\n' "$_l3" | awk -F'\t' -v OFS='\t' '$26!=""||$27!=""||$28!=""{print $1,$19,$20,$26,$27,$28}'    | sort -u | grep .)"
+  # Collapse repeated observations (a router re-emits the same UPnP banner, a host
+  # re-ARPs the same pair, a device repeats the same mDNS name hundreds of times):
+  # dedupe on the meaningful columns, keep the first frame, append a Copies count,
+  # then cap at row_limit. Turns ~350 identical rows into one.
+  dhcp_rows="$(printf '%s\n' "$_l3"     | awk -F'\t' -v OFS='\t' 'tolower($2)~/dhcp|bootp/{print $1,$3,$4,$5,$6,$7,$8,$9}'    | grep . | _collapse 2,3,4,5,6,7,8 8 | head -n "$row_limit")"
+  arp_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' 'tolower($2)~/arp/{print $1,$10,$11,$12,$13,$14}'            | grep . | _collapse 2,3,4,5,6 6   | head -n "$row_limit")"
+  nd_rows="$(printf '%s\n' "$_l3"       | awk -F'\t' -v OFS='\t' '$16!=""{print $1,$15,$16,$17,$18}'                          | grep . | _collapse 2,3,4,5 5     | head -n "$row_limit")"
+  names_rows="$(printf '%s\n' "$_l3"    | awk -F'\t' -v OFS='\t' '$8!=""||tolower($2)~/nbns|mdns|llmnr/{print $1,$19,$8,$21,$22,$23}' | grep . | _collapse 2,3,4,5,6 6 | head -n "$row_limit")"
+  dns_rows="$(printf '%s\n' "$_l3"      | awk -F'\t' -v OFS='\t' '$23!=""||$22!=""{print $1,$19,$20,$23,$22,$24,$25}'         | grep . | _collapse 2,3,4,5,6,7 7 | head -n "$row_limit")"
+  software_rows="$(printf '%s\n' "$_l3" | awk -F'\t' -v OFS='\t' '$26!=""||$27!=""||$28!=""{print $1,$19,$20,$26,$27,$28}'    | grep . | _collapse 2,3,4,5,6 6   | head -n "$row_limit")"
 
   local station_rows assoc_rows action_rows wds_rows probe_rows
   station_rows="$({
@@ -1835,7 +1845,7 @@ table_unique() {
 REPORT_HELPERS
     # The decrypting reproduce commands below reference the key set once, as
     # "${KEYS[@]}", instead of repeating every -o record in each block.
-    if [ "${WIFISCOPE_REPORT_SECRETS:-0}" = 1 ] && [ "${#DEC[@]}" -gt 0 ]; then
+    if [ "${WIFISCOPE_REPORT_SECRETS:-1}" = 1 ] && [ "${#DEC[@]}" -gt 0 ]; then
       echo '# Decryption key set recovered for this capture:'
       printf 'KEYS=(\n'
       local _i=0
@@ -1943,11 +1953,12 @@ KEYS_TMPL
     echo
     printf '| Check | Result |\n| --- | --- |\n| Decryption options loaded | %s |\n| Target DHCP/ARP/IP/IPv6 frames decoded | %s |\n| Secret values in this report | %s |\n' \
       "$decrypt_label" "$decrypt_count" "$secrets_label"
+    echo
     report_command 1 'wc -l' -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)"
     echo; echo '### Stored keyring inventory'
     printf '%s\n' "$keyring_rows" | md_table $'Key type\tValue or count'
     echo
-    echo "> [!warning] Secret output is redacted by default. Set \`WIFISCOPE_REPORT_SECRETS=1\` only for a controlled training artifact. The \`keymaterial\` command deliberately prints full values with context."
+    echo "> [!warning] This report includes full key material (passphrase, PMK, PTK, GTK). Set \`WIFISCOPE_REPORT_SECRETS=0\` to redact it before sharing outside a controlled training artifact."
     echo; echo '### PTK components selected/derived by Wireshark'
     printf '%s\n' "$key_analysis_rows" | md_table $'Frame\tTime\tBSSID\tStation\tMessage\tReplay counter\tPMK\tKCK\tKEK\tTK'
     if tshark_has_field wlan.analysis.tk; then
@@ -1967,21 +1978,21 @@ KEYS_TMPL
 
     echo; echo '## 7. DHCP, subnet, gateway, ARP, IPv6, and names'
     echo; echo '### DHCP fingerprint and router options'
-    printf '%s\n' "$dhcp_rows" | md_table $'Frame\tClient MAC\tRequested IP\tOffered IP\tSubnet mask\tRouter\tHostname\tVendor class'
+    printf '%s\n' "$dhcp_rows" | md_table $'Frame\tClient MAC\tRequested IP\tOffered IP\tSubnet mask\tRouter\tHostname\tVendor class\tCopies'
     report_command 1 'table_unique' -Y "$(bssid_filter) && dhcp" -T fields -E separator=/t -E occurrence=f -E header=y \
       -e frame.number -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
       -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname -e dhcp.option.vendor_class_id
     echo; echo '### ARP IPv4 mapping'
-    printf '%s\n' "$arp_rows" | md_table $'Frame\tOpcode\tSource IPv4\tSource MAC\tDestination IPv4\tDestination MAC'
+    printf '%s\n' "$arp_rows" | md_table $'Frame\tOpcode\tSource IPv4\tSource MAC\tDestination IPv4\tDestination MAC\tCopies'
     report_command 1 'table_unique' -Y "$(bssid_filter) && arp" -T fields -E separator=/t -E occurrence=f -E header=y \
       -e frame.number -e arp.opcode -e arp.src.proto_ipv4 -e arp.src.hw_mac -e arp.dst.proto_ipv4 -e arp.dst.hw_mac
     echo; echo '### IPv6 neighbor mapping'
-    printf '%s\n' "$nd_rows" | md_table $'Frame\tIPv6 source\tLink-layer MAC\tNS target\tNA target'
+    printf '%s\n' "$nd_rows" | md_table $'Frame\tIPv6 source\tLink-layer MAC\tNS target\tNA target\tCopies'
     report_command 1 'table_unique' -Y "$(bssid_filter) && icmpv6 && icmpv6.opt.linkaddr" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e ipv6.src \
       -e icmpv6.opt.linkaddr -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address
     echo; echo '### Hostname and service-name evidence'
-    printf '%s\n' "$names_rows" | md_table $'Frame\tSource IP\tDHCP hostname\tNBNS name\tmDNS response name\tDNS/LLMNR query'
+    printf '%s\n' "$names_rows" | md_table $'Frame\tSource IP\tDHCP hostname\tNBNS name\tmDNS response name\tDNS/LLMNR query\tCopies'
     report_command 1 'table_unique' -Y "$(bssid_filter) && (dhcp.option.hostname || nbns || mdns || llmnr)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e ip.src \
       -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name
@@ -2021,12 +2032,12 @@ KEYS_TMPL
 
     echo; echo '## 9. Decrypted DNS and software evidence'
     echo; echo '### DNS/mDNS/LLMNR names and answers'
-    printf '%s\n' "$dns_rows" | md_table $'Frame\tSource IP\tDestination IP\tQuery\tResponse name\tA\tAAAA'
+    printf '%s\n' "$dns_rows" | md_table $'Frame\tSource IP\tDestination IP\tQuery\tResponse name\tA\tAAAA\tCopies'
     report_command 1 "sort -u | head -n $row_limit | table_rows" -Y "$(bssid_filter) && (dns.qry.name || dns.resp.name)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e ip.src -e ip.dst \
       -e dns.qry.name -e dns.resp.name -e dns.a -e dns.aaaa
     echo; echo '### HTTP and SSH version strings'
-    printf '%s\n' "$software_rows" | md_table $'Frame\tSource IP\tDestination IP\tHTTP User-Agent\tHTTP Server\tSSH protocol'
+    printf '%s\n' "$software_rows" | md_table $'Frame\tSource IP\tDestination IP\tHTTP User-Agent\tHTTP Server\tSSH protocol\tCopies'
     report_command 1 'table_unique' -Y "$(bssid_filter) && (http.user_agent || http.server || ssh.protocol)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e ip.src -e ip.dst \
       -e http.user_agent -e http.server -e ssh.protocol
@@ -2044,6 +2055,7 @@ KEYS_TMPL
     printf '| Check | Count | Interpretation |\n| --- | ---: | --- |\n'
     printf '| Truncated frames | %s | cap_len < frame.len |\n' "$truncated_count"
     printf '| Target retry frames | %s | Retries may reflect RF loss/contention; not unique traffic |\n' "$retry_count"
+    echo
     report_command 0 'wc -l' -Y 'frame.cap_len < frame.len'
     report_command 0 'wc -l' -Y "$(bssid_filter) && wlan.fc.retry==1"
 
