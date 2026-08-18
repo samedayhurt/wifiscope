@@ -1016,8 +1016,16 @@ _report_map_python() {
   fi
   section "🗺️  drawing network map for $title"
   # --- collect data into TSV files the generator reads ---
-  # beacons carry a 5th column now: the (hex-decoded) SSID, so the generator can
-  # label each physical unit with the SSIDs it radiates.
+  # When called from report() (MAP_PREFILL set) the beacon / WPS / client TSVs are
+  # handed over from evidence report() already collected, so we skip re-scanning the
+  # whole capture for them. Standalone map/mapall extract here as before.
+  if [ -n "${MAP_PREFILL:-}" ] && [ -f "$MAP_PREFILL/beacons.tsv" ]; then
+    cp "$MAP_PREFILL/beacons.tsv" "$wd/beacons.tsv"
+    cp "$MAP_PREFILL/wps.tsv"     "$wd/wps.tsv"
+    cp "$MAP_PREFILL/clients.tsv" "$wd/clients.tsv"
+  else
+  # beacons carry a 5th column: the (hex-decoded) SSID, so the generator can label
+  # each physical unit with the SSIDs it radiates.
   ts  -Y "$bfilt" -T fields -e wlan.bssid -e wlan.ds.current_channel \
       -e wlan.ht.info.primarychannel -e radiotap.channel.freq -e wlan.ssid \
       -e radiotap.dbm_antsignal 2>/dev/null \
@@ -1044,6 +1052,7 @@ _report_map_python() {
           if(c in AP) next;                                 # client column is an AP
           if(tolower(substr(c,2,1)) ~ /[13579bdf]/) next;   # group-addressed
           print c,b }' | sort -u > "$wd/clients.tsv"
+  fi
   ts  -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u > "$wd/backhaul.tsv"
   # ONE decrypt pass feeds every L3 layer of the map (dhcp/gateway/arp/ND/names/
   # protocols/conversations). Each tsd pass re-decrypts the whole capture, so nine
@@ -2019,7 +2028,16 @@ KEYS_TMPL
   } > "$out"
 
   ok "wrote $out (secrets: $secrets_label)"
-  WIFISCOPE_REPORT_CONTEXT=1 _report_map_python "$mapout" >/dev/null
+  # Hand the map the beacon / WPS / client evidence the report already collected so
+  # it doesn't re-scan the whole capture for them (saves ~6 full-capture passes).
+  # Only plain L2 families are reused; the map still runs its own decrypt L3 pass.
+  local _pf; _pf="$(mktemp -d)"
+  # One row per beacon frame (NOT sort -u) so the map's RSSI average stays weighted.
+  printf '%s\n' "$_bcn" | awk -F'\t' -v OFS='\t' '{for(i=1;i<=8;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)} if($2!="")print $2,$5,$6,$7,$4,$8}' | dessid 5 > "$_pf/beacons.tsv"
+  printf '%s\n' "$wps_rows" | awk -F'\t' -v OFS='\t' 'NF>1{print $2,$3,$4,$5,$6,$7,$8}' | sort -u > "$_pf/wps.tsv"
+  printf '%s\n' "$station_rows" | awk -F'\t' -v OFS='\t' '$1!=""&&$2!=""{print $1,$2}' | sort -u > "$_pf/clients.tsv"
+  MAP_PREFILL="$_pf" WIFISCOPE_REPORT_CONTEXT=1 _report_map_python "$mapout" >/dev/null
+  rm -rf "$_pf"
 }
 
 # =============================================================================
