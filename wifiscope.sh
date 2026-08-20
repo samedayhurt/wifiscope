@@ -374,12 +374,17 @@ print_tshark_command() {
   fi
   argv+=("$@")
 
-  printf '$ tshark'
+  # Accumulate and emit ONCE. This used to be a dozen separate printf calls, and
+  # ts()/tsd() send them to stderr while section() writes to stdout - two streams
+  # with different buffering, so the writes interleaved and shredded each other
+  # mid-line: "$ tshark" landing above a heading, orphan " \" continuations, and a
+  # heading with its first characters eaten.
+  local _out='$ tshark'
   local i=0 a v q chunk
   while [ "$i" -lt "${#argv[@]}" ]; do
     a="${argv[$i]}"; i=$((i+1)); chunk=""
     if [ -n "${REPORT_KEYSET_TOKEN:-}" ] && [ "$a" = "$REPORT_KEYSET_TOKEN" ]; then
-      printf ' \\\n  %s' "$a"; continue   # emit the key-set placeholder verbatim
+      _out+=' \'$'\n'"  $a"; continue   # the key-set placeholder, verbatim
     fi
     case "$a" in
       -r|-o|-Y|-T|-E|-e|-z|-N|-c|-a)
@@ -397,9 +402,9 @@ print_tshark_command() {
         ;;
       *) chunk="$(shell_quote_human "$a")" ;;
     esac
-    printf ' \\\n  %s' "$chunk"
+    _out+=' \'$'\n'"  $chunk"
   done
-  printf '\n'
+  printf '%s\n' "$_out"
 }
 
 # Readable Bash quoting for generated playbook commands.  `%q` is correct but
@@ -416,9 +421,7 @@ shell_quote_human() {
 #      it, then actually runs it. Use this for anything in cleartext management
 #      frames: beacons, WPS, RSN, association, 4-address backhaul.
 ts() {
-  printf '%s' "$C_DIM$C_GRN" >&2
-  print_tshark_command 0 0 "$@" >&2
-  printf '%s' "$C_RESET" >&2
+  printf '%s%s%s\n' "$C_META" "$(print_tshark_command 0 0 "$@")" "$C_RESET" >&2
   # `tr -d '\r'` strips carriage returns so sort -u/grep behave when the pcap is
   # read by a Windows tshark.exe (CRLF output). On Linux it's a harmless no-op.
   "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" "$@" | tr -d '\r'
@@ -432,9 +435,7 @@ tsd() {
   if [ "${#DEC[@]}" -eq 0 ]; then
     warn "no decryption key set — run 'k' (menu) or pass a passphrase; results may be empty"
   fi
-  printf '%s' "$C_DIM$C_GRN" >&2
-  print_tshark_command 1 0 "$@" >&2
-  printf '%s' "$C_RESET" >&2
+  printf '%s%s%s\n' "$C_META" "$(print_tshark_command 1 0 "$@")" "$C_RESET" >&2
   "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" "${DEC[@]}" "$@" | tr -d '\r'
 }
 
@@ -1529,9 +1530,7 @@ hosts() {
 #   still show each command next to its own result, in a deterministic order.
 show_cmd() {
   local d="$1"; shift
-  printf '%s' "$C_DIM$C_GRN" >&2
-  print_tshark_command "$d" 0 "$@" >&2
-  printf '%s' "$C_RESET" >&2
+  printf '%s%s%s\n' "$C_META" "$(print_tshark_command "$d" 0 "$@")" "$C_RESET" >&2
 }
 
 # wifi_generation: map the capability elements in an association request to the
