@@ -222,6 +222,16 @@ if [ -n "${WIFISCOPE_FORCE_COLOR:-}" ] || { [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; 
   C_CYN=$'\e[36m'
   C_ORG=$'\e[38;5;208m'
   UX_LINKS=1
+  # ---- semantic layer -------------------------------------------------------
+  # One structural accent (cyan) and everything else strictly meaning-bearing, so
+  # colour on screen is always information rather than decoration. Call sites use
+  # THESE names; the raw C_* above are just the ink.
+  C_ACCENT="$C_B$C_CYN"   # structure: headings, the target BSSID
+  C_GOOD="$C_GRN"         # strong / verified / complete
+  C_WARN="$C_YEL"         # caution: dated crypto, partial evidence, caveats
+  C_BAD="$C_RED"          # weak / absent / exploitable
+  C_SECRET="$C_MAG"       # key material, and only key material
+  C_META="$C_DIM"
 else
   C_RESET=
   C_B=
@@ -233,6 +243,12 @@ else
   C_MAG=
   C_CYN=
   C_ORG=
+  C_ACCENT=
+  C_GOOD=
+  C_WARN=
+  C_BAD=
+  C_SECRET=
+  C_META=
   UX_LINKS=0
 fi
 
@@ -253,7 +269,9 @@ case "$UX_WIDTH" in ''|*[!0-9]*) UX_WIDTH=76 ;; esac
 [ "$UX_WIDTH" -lt 40 ] && UX_WIDTH=76
 [ "$UX_WIDTH" -gt 100 ] && UX_WIDTH=100
 
-# hr [CHAR]: a full-width rule, so sections read as blocks instead of a wall of text.
+SECTION_W=56          # target width of a section heading incl. its trailing rule
+
+# hr [CHAR]: a full-width rule. Kept for the menu frame; sections use a short rule.
 hr() {
   local ch="${1:-─}" i out=''
   for ((i = 0; i < UX_WIDTH; i++)); do out+="$ch"; done
@@ -261,21 +279,39 @@ hr() {
 }
 # section: a top-level heading with a rule under it. The rule is what separates one
 # command's output from the next when you scroll back through a long session.
+# section: heading with a short trailing rule sized to the text. The rule used to
+#   span the whole terminal, which made it the loudest thing on screen and pushed
+#   wide tables around; hugging the title keeps the separation without the shouting.
 section() {
-  printf '\n%s── %s%s\n' "$C_B$C_CYN" "$*" "$C_RESET"
-  hr
+  local title="$*" pad n plain wide
+  # Most headings carry an emoji, which counts as one character but occupies two
+  # columns, so a naive ${#title} makes those rules overshoot. Count the non-ASCII
+  # characters and charge them double.
+  plain="${title//[! -~]/}"
+  wide=$(( ${#title} - ${#plain} ))
+  n=$(( SECTION_W - ${#plain} - wide * 2 - 4 ))   # 4 = "── " plus a trailing space
+  [ "$n" -lt 6 ] && n=6                           # never degenerate to nothing
+  # NOT tr: it substitutes byte-for-byte and '─' is three UTF-8 bytes, which produced
+  # a run of invalid characters instead of a rule.
+  pad=''
+  while [ "${#pad}" -lt "$n" ]; do pad+='─'; done
+  printf '\n%s── %s %s%s\n' "$C_ACCENT" "$title" "$pad" "$C_RESET"
 }
 # subsection: a lighter heading for a group inside a section.
 subsection() { printf '\n%s  %s%s\n' "$C_B" "$*" "$C_RESET"; }
 # kv LABEL VALUE: an aligned "label : value" line for single facts, so a screen of
 # verdicts lines up instead of drifting with each label's length. Goes to STDOUT —
 # these are results, not status, and belong in a piped/exported capture of the run.
-kv() { printf '   %s%-14s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"; }
+kv() { printf '   %s%-14s%s %s\n' "$C_META" "$1" "$C_RESET" "$2"; }
 # note/ok/die: status lines to stderr, so they never pollute piped data or reports.
-note() { printf '%s  · %s%s\n' "$C_DIM$C_YEL" "$*" "$C_RESET" >&2; }
-ok() { printf '%s  ✔ %s%s\n' "$C_GRN" "$*" "$C_RESET" >&2; }
+# note = neutral progress/metadata. warn = something the reader must weigh. Keeping
+# those apart is the whole point of a semantic palette: amber that fires on "indexing
+# capture..." teaches you to ignore amber.
+note() { printf '%s  · %s%s\n' "$C_META" "$*" "$C_RESET" >&2; }
+warn() { printf '%s  ! %s%s\n' "$C_WARN" "$*" "$C_RESET" >&2; }
+ok() { printf '%s  ✔ %s%s\n' "$C_GOOD" "$*" "$C_RESET" >&2; }
 die() {
-  printf '%s✖ %s%s\n' "$C_B$C_RED" "$*" "$C_RESET" >&2
+  printf '%s✖ %s%s\n' "$C_B$C_BAD" "$*" "$C_RESET" >&2
   exit 1
 }
 
@@ -293,7 +329,7 @@ paint() {
     return
   }
   awk -v T="${TGT_BSSIDS[*]}" -v A="${ALL_BSSIDS[*]}" -v links="$UX_LINKS" \
-    -v cyn="$C_B$C_CYN" -v blu="$C_BLU" -v grn="$C_GRN" -v yel="$C_YEL" -v rst="$C_RESET" '
+    -v cyn="$C_ACCENT" -v blu="$C_META" -v grn="" -v yel="$C_WARN" -v rst="$C_RESET" '
     BEGIN{ h="[0-9A-Fa-f][0-9A-Fa-f]"; RE=h":"h":"h":"h":"h":"h;
            n=split(T,x," "); for(i=1;i<=n;i++) TT[tolower(x[i])]=1;
            m=split(A,y," "); for(i=1;i<=m;i++) AA[tolower(y[i])]=1; }
@@ -394,7 +430,7 @@ ts() {
 #      If no key has been set it warns and just runs in the clear.
 tsd() {
   if [ "${#DEC[@]}" -eq 0 ]; then
-    note "no decryption key set — run 'k' (menu) or pass a passphrase; results may be empty"
+    warn "no decryption key set — run 'k' (menu) or pass a passphrase; results may be empty"
   fi
   printf '%s' "$C_DIM$C_GRN" >&2
   print_tshark_command 1 0 "$@" >&2
@@ -1104,13 +1140,13 @@ sae_passphrase_warning() {
   [ -n "$SSID" ] || return 0
   target_is_sae || return 0
   if target_has_psk; then
-    note "WPA2/WPA3 transition BSS: this passphrase only decrypts clients that joined with WPA2-PSK."
-    note "SAE clients need harvested key material instead — 'h' harvest, or 'a' addkey with a PTK-TK/GTK."
+    warn "WPA2/WPA3 transition BSS: this passphrase only decrypts clients that joined with WPA2-PSK."
+    warn "SAE clients need harvested key material instead — 'h' harvest, or 'a' addkey with a PTK-TK/GTK."
   else
-    note "⚠ $SSID is WPA3-SAE only: a passphrase CANNOT decrypt it."
-    note "  wpa-pwd means PBKDF2(passphrase,SSID) = the WPA2 PMK. SAE derives its PMK from the"
-    note "  elliptic-curve exchange, so the password alone is not enough — even when it is correct."
-    note "  Use 'h' harvest / 'g' scrapegtk / 'a' addkey to load a PTK-TK or GTK directly."
+    warn "⚠ $SSID is WPA3-SAE only: a passphrase CANNOT decrypt it."
+    warn "  wpa-pwd means PBKDF2(passphrase,SSID) = the WPA2 PMK. SAE derives its PMK from the"
+    warn "  elliptic-curve exchange, so the password alone is not enough — even when it is correct."
+    warn "  Use 'h' harvest / 'g' scrapegtk / 'a' addkey to load a PTK-TK or GTK directly."
   fi
 }
 
@@ -1180,8 +1216,10 @@ crypto() {
   IFS=$'\t' read -r cls txt < <(printf '%s\n' "$akms" | classify_akm "$priv" "$wpa1")
   local col
   case "$cls" in
-  strong) col="$C_GRN" ;; trans) col="$C_YEL" ;; ent) col="$C_MAG" ;;
-  weak | open) col="$C_RED" ;; *) col="$C_B" ;;
+  strong | ent) col="$C_GOOD" ;;      # WPA3 / Enterprise: current practice
+  trans | weak) col="$C_WARN" ;;      # transition or WPA2-PSK: dated, not broken
+  open) col="$C_BAD" ;;               # open / WEP / WPA1: actually unprotected
+  *) col="$C_B" ;;
   esac
   printf '\n%s🔒 verdict:%s %s%s%s\n' "$C_B" "$C_RESET" "$col$C_B" "$txt" "$C_RESET"
 
@@ -1217,7 +1255,7 @@ crypto() {
   fi
 
   if target_is_sae && [ -z "$mfpr" ]; then
-    note "SAE advertised but PMF is not required — that combination is out of spec for WPA3-Personal."
+    warn "SAE advertised but PMF is not required — that combination is out of spec for WPA3-Personal."
   fi
   sae_passphrase_warning
 }
@@ -1655,9 +1693,9 @@ pmkid() {
   # the ECC exchange, so an SAE PMKID is not a password oracle — it is just an
   # identifier. Flag it, or the hashcat run below is wasted effort.
   if target_is_sae && ! target_has_psk; then
-    note "target is WPA3-SAE only: any PMKID below is NOT offline-crackable (the PMK is not derived from the passphrase)"
+    warn "target is WPA3-SAE only: any PMKID below is NOT offline-crackable (the PMK is not derived from the passphrase)"
   elif target_is_sae; then
-    note "transition-mode BSS: only PMKIDs from WPA2-PSK associations are crackable; SAE ones are not"
+    warn "transition-mode BSS: only PMKIDs from WPA2-PSK associations are crackable; SAE ones are not"
   fi
   ts -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
      -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid \
@@ -1719,8 +1757,8 @@ export22000() {
   # is PBKDF2(passphrase,SSID) — i.e. WPA2-PSK. On an SAE-only BSS the export may
   # still produce lines, and cracking them cannot succeed.
   if target_is_sae && ! target_has_psk; then
-    note "⚠ $SSID is WPA3-SAE only — hashcat -m 22000 cannot recover an SAE passphrase from this."
-    note "  SAE is not offline-crackable this way; capture/derive a PTK-TK or GTK instead ('h' harvest)."
+    warn "⚠ $SSID is WPA3-SAE only — hashcat -m 22000 cannot recover an SAE passphrase from this."
+    warn "  SAE is not offline-crackable this way; capture/derive a PTK-TK or GTK instead ('h' harvest)."
   fi
   local how
   if how="$(_hc22000_build "$out")"; then
@@ -1772,10 +1810,10 @@ handshakes() {
     printf '%s\n' "$sae" |
       tcol $'Source\tDestination\tBSSID\tCommit\tConfirm\tStatus'
     note "a completed SAE needs Commit and Confirm in BOTH directions; status 76 = anti-clogging token, 77 = unsupported group"
-    note "SAE-derived PMKs are not recoverable from the passphrase — the EAPOL rows above are not crackable on an SAE-only BSS"
+    warn "SAE-derived PMKs are not recoverable from the passphrase — the EAPOL rows above are not crackable on an SAE-only BSS"
   elif target_is_sae; then
     printf '  (none observed)\n'
-    note "the target advertises SAE but no SAE auth frames were captured — the association happened before this capture started"
+    warn "the target advertises SAE but no SAE auth frames were captured — the association happened before this capture started"
   fi
 }
 
@@ -3762,7 +3800,7 @@ main() {
         PASS="$3"; kr_add wpa-pwd "$PASS:$SSID"; rebuild_dec
       fi
       # bands/crypto/etc need an SSID; nudge if it's missing (recon/mapall don't).
-      [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && note "no SSID given — pass one as arg 2 for scoped results"
+      [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && warn "no SSID given — pass one as arg 2 for scoped results"
       # Paint the read-only display commands; run the rest (report/harvest/…) direct.
       # mapall takes no SSID, so its arg-2 (if any) is the output .drawio filename.
       case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes fingerprint keymaterial " in
@@ -3800,7 +3838,7 @@ main() {
       load_target_bssids
       note "target SSID: $SSID  (${#TGT_BSSIDS[@]} BSSIDs)"
     else
-      note "SSID \"$SSID\" is not in this capture — falling back to the picker"
+      warn "SSID \"$SSID\" is not in this capture — falling back to the picker"
       SSID=""
       pick_ssid
     fi
