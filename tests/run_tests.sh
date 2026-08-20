@@ -141,7 +141,7 @@ _wsabs="$PWD/wifiscope.sh"
 _pgdir="$TMP/pgcheck"; mkdir -p "$_pgdir"
 _perr="$_pgdir/stderr.txt"
 ( cd "$_pgdir" && NO_COLOR=1 TSHARK="$TSHARK" "$_wsabs" report "$PCAP" MainNet >/dev/null 2>"$_perr" )
-_pgmd="$_pgdir/wifiscope_MainNet.md"
+_pgmd="$_pgdir/MainNet_analysis.md"
 if [ -s "$_pgmd" ]; then
   ok "progress leak check actually produced a report to inspect"
   if grep -qE '━|leave it running|passes complete' "$_perr"; then bad "progress leaked into redirected stderr"
@@ -168,8 +168,17 @@ ROOT="$(pwd)"
 printf '#!/usr/bin/env bash\nprintf called > %q\nexec %q "$@"\n' "$TMP/report-python-called" "$PYTHON_REAL" > "$TMP/report-python3"
 chmod +x "$TMP/report-python3"
 (cd "$TMP" && NO_COLOR=1 TSHARK="$TSHARK" PYTHON3="$TMP/report-python3" "$ROOT/wifiscope.sh" report "$PCAP" MainNet >/dev/null 2>&1)
-REPORT="$TMP/wifiscope_MainNet.md"; RMAP="$TMP/wifiscope_MainNet.drawio"
+REPORT="$TMP/MainNet_analysis.md"; RMAP="$TMP/MainNet_analysis.drawio"
 if [ -e "$TMP/report-python-called" ]; then ok "python3 was confined to report generation"; else bad "report did not invoke its report-only python3"; fi
+assert_lacks "report carries no tool branding" "iFiScope" <<<"$(cat "$REPORT")"
+assert_lacks "report frontmatter has no branded key" "wifiscope_version" <<<"$(cat "$REPORT")"
+assert_lacks "no bare --- divider between the halves" $'\n---\n\n# Detailed' <<<"$(cat "$REPORT")"
+assert_lacks "operator sections use visible prose, not invisible HTML comments" "<!--" <<<"$(cat "$REPORT")"
+# The fixture contains no probe requests at all, so assert the table shape in the
+# source rather than in this particular report.
+grep -q "md_table \$'Station\\\\tMAC type\\\\tProbes\\\\tSSID sought'" "$WS" \
+  && ok "probing stations render as a table, not a bullet per station" \
+  || bad "probing stations are not rendered as a table"
 assert_has "report has Obsidian frontmatter" "title: 'MainNet Mission Report'" <<<"$(cat "$REPORT")"
 assert_has "report frontmatter carries author and date" "author: '" <<<"$(cat "$REPORT")"
 assert_has "mission report answers Router Info first" "- **2.4GHz MAC:**" <<<"$(cat "$REPORT")"
@@ -189,7 +198,7 @@ assert_has "report shows the real key in the reproduction command" 'uat:80211_ke
 mkdir -p "$TMP/red"
 (cd "$TMP/red" && NO_COLOR=1 TSHARK="$TSHARK" WIFISCOPE_REPORT_SECRETS=0 PYTHON3="$TMP/report-python3" \
   "$ROOT/wifiscope.sh" report "$PCAP" MainNet >/dev/null 2>&1)
-REDACTED="$TMP/red/wifiscope_MainNet.md"
+REDACTED="$TMP/red/MainNet_analysis.md"
 assert_has "WIFISCOPE_REPORT_SECRETS=0 redacts the keyring inventory" 'stored value(s) — REDACTED' <<<"$(cat "$REDACTED")"
 assert_has "WIFISCOPE_REPORT_SECRETS=0 templates the reproduction key set" 'uat:80211_keys:"wpa-pwd","<passphrase>:<SSID>"' <<<"$(cat "$REDACTED")"
 assert_lacks "WIFISCOPE_REPORT_SECRETS=0 does not leak the stored TK" "00112233445566778899aabbccddeeff" <<<"$(cat "$REDACTED")"
@@ -226,7 +235,7 @@ awk '/^_hc22000_build\(\) \{/,/^\}$/' "$WS" | grep -q 'need ' \
 echo "== decrypt recipe sits with the router info AND stays in section 6 =="
 assert_has "Key Material block next to Router Info" "### Key Material" <<<"$(cat "$REPORT")"
 assert_has "section 6 key inventory still present" "### Stored keyring inventory" <<<"$(cat "$REPORT")"
-assert_has "recipe names the keyring file" "reapplies them on every run" <<<"$(cat "$REPORT")"
+assert_has "recipe names the keyring file" "they are reapplied on every run" <<<"$(cat "$REPORT")"
 
 echo "== probing MACs are scoped to the selected target =="
 assert_has "probing section explains the scoping" "hunting for **this** network" <<<"$(cat "$REPORT")"

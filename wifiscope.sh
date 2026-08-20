@@ -52,6 +52,19 @@ TSHARK_FIELDS_LOADED=0
 TGT_AKMS=""         # cached AKM suite numbers advertised by the target (lazy, see target_akms)
 TGT_AKMS_LOADED=0
 
+# ---- tshark log noise --------------------------------------------------------
+# tshark writes dissector complaints to STDERR mid-run, e.g.
+#   ** (tshark:3393) [packet-ssh WARNING] ... NOT SUPPORTED OR UNKNOWN KEX DETECTED
+# Those are about the CAPTURE's traffic, not about anything we did, and because our
+# teaching output also goes to stderr the two interleave and shred each other
+# mid-line. `--log-level critical` drops them while still surfacing real failures
+# (an invalid -e field, an unreadable file), which we very much want to see.
+# Gated on support so an older tshark that lacks the flag still runs.
+TSHARK_QUIET=()
+if "$TSHARK" --help 2>&1 | grep -q -- '--log-level'; then
+  TSHARK_QUIET=(--log-level critical)
+fi
+
 # ---- concurrency budget -----------------------------------------------------
 # report/fingerprint fan their INDEPENDENT tshark passes out concurrently. Each of
 # those passes dissects the ENTIRE capture, so each one costs real memory - and on a
@@ -372,7 +385,7 @@ ts() {
   printf '%s' "$C_RESET" >&2
   # `tr -d '\r'` strips carriage returns so sort -u/grep behave when the pcap is
   # read by a Windows tshark.exe (CRLF output). On Linux it's a harmless no-op.
-  "$TSHARK" -r "$PCAP" "$@" | tr -d '\r'
+  "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" "$@" | tr -d '\r'
 }
 
 # tsd: like ts() but ALSO passes the decryption keys ("${DEC[@]}").
@@ -386,14 +399,14 @@ tsd() {
   printf '%s' "$C_DIM$C_GRN" >&2
   print_tshark_command 1 0 "$@" >&2
   printf '%s' "$C_RESET" >&2
-  "$TSHARK" -r "$PCAP" "${DEC[@]}" "$@" | tr -d '\r'
+  "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" "${DEC[@]}" "$@" | tr -d '\r'
 }
 
 # Quiet query helpers used by the report generator.  These deliberately do not
 # emit teaching lines because the corresponding command is printed beside each
 # report result by report_command().
-tq()  { "$TSHARK" -r "$PCAP" "$@" 2>/dev/null | tr -d '\r'; }
-tqd() { "$TSHARK" -r "$PCAP" "${DEC[@]}" "$@" 2>/dev/null | tr -d '\r'; }
+tq()  { "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" "$@" 2>/dev/null | tr -d '\r'; }
+tqd() { "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" "${DEC[@]}" "$@" 2>/dev/null | tr -d '\r'; }
 
 # ---- filter helpers ---------------------------------------------------------
 # beacons_of_target: display filter for "beacon frames of the chosen SSID".
@@ -453,7 +466,7 @@ need_all_bssids() {
   [ -n "$PCAP" ] || return 0
   note "indexing capture (one pass to list all BSSIDs)..."
   mapfile -t ALL_BSSIDS < <(
-    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.bssid 2>/dev/null |
+    "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.bssid 2>/dev/null |
       tr -d '\r' | drop_group | sort -u | grep .
   )
   ALL_BSSIDS_LOADED=1
@@ -470,13 +483,13 @@ need_all_bssids() {
 ssid_exists() {
   local n
   # Stage 1: beacons — the normal case, and usually an early hit.
-  n="$("$TSHARK" -l -r "$PCAP" -Y "wlan.fc.type_subtype==8 && wlan.ssid==\"$1\"" \
+  n="$("$TSHARK" "${TSHARK_QUIET[@]}" -l -r "$PCAP" -Y "wlan.fc.type_subtype==8 && wlan.ssid==\"$1\"" \
     -T fields -e wlan.bssid 2>/dev/null | tr -d '\r' | grep -m1 . )"
   [ -n "$n" ] && return 0
   # Stage 2: a hidden AP beacons with a zero-length SSID, so the name only ever
   # appears in probe responses (5) and association requests (0). Without this a
   # perfectly valid hidden target would look like a typo. Also early-exit.
-  n="$("$TSHARK" -l -r "$PCAP" \
+  n="$("$TSHARK" "${TSHARK_QUIET[@]}" -l -r "$PCAP" \
     -Y "(wlan.fc.type_subtype==5 || wlan.fc.type_subtype==0) && wlan.ssid==\"$1\"" \
     -T fields -e wlan.bssid 2>/dev/null | tr -d '\r' | grep -m1 . )"
   [ -n "$n" ]
@@ -490,7 +503,7 @@ ssid_exists() {
 #   BSSID. Returns the most-seen name, or empty if the SSID was never disclosed.
 resolve_hidden() {
   local b="$1"
-  "$TSHARK" -r "$PCAP" \
+  "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" \
     -Y "wlan.bssid==$b && (wlan.fc.type_subtype==5 || wlan.fc.type_subtype==0) && wlan.ssid != \"\"" \
     -T fields -e wlan.ssid 2>/dev/null | tr -d '\r' | dessid 1 |
     grep -v '<MISSING>' | grep . | sort | uniq -c | sort -rn | sed 's/^ *[0-9]* *//' | head -1
@@ -500,14 +513,14 @@ pick_ssid() {
   section "networks in this capture"
   # Build a numbered list of unique, non-empty SSIDs.
   mapfile -t names < <(
-    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.ssid 2>/dev/null |
+    "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.ssid 2>/dev/null |
       tr -d '\r' | dessid 1 | sort | uniq -c | sort -rn | sed 's/^ *//' |
       grep -v '^[0-9]* *$' | grep -v '<MISSING>' # named nets; hidden ones handled below
   )
   # Hidden APs beacon with a zero-length SSID; list them too (with any recovered
   # name) so a hidden target can still be selected — it scopes by BSSID afterward.
   mapfile -t hidden < <(
-    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8 && (wlan.ssid=="" || wlan.ssid=="<MISSING>")' \
+    "$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" -Y 'wlan.fc.type_subtype==8 && (wlan.ssid=="" || wlan.ssid=="<MISSING>")' \
       -T fields -e wlan.bssid 2>/dev/null | tr -d '\r' | sort -u | grep .
   )
   local i=1 line b nm
@@ -556,7 +569,7 @@ load_target_bssids() {
   # BSSID as ff:ff:ff:ff:ff:ff, and accepting that scopes every later filter to the
   # broadcast address — which matches nothing useful while looking like a success.
   local _raw
-  _raw="$("$TSHARK" -r "$PCAP" -Y "$(beacons_of_target)" -T fields -E aggregator=, \
+  _raw="$("$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" -Y "$(beacons_of_target)" -T fields -E aggregator=, \
     -e wlan.bssid -e wlan.rsn.akms.type 2>/dev/null | tr -d '\r')"
   mapfile -t TGT_BSSIDS < <(printf '%s\n' "$_raw" | cut -f1 | drop_group | sort -u | grep .)
   TGT_AKMS="$(printf '%s\n' "$_raw" | cut -f2 | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' | sort -un)"
@@ -568,7 +581,7 @@ load_target_bssids() {
   # requests — scope by the BSSIDs seen there, and take the AKMs from the same
   # frames. Costs an extra pass ONLY when stage 1 came back empty.
   if [ "${#TGT_BSSIDS[@]}" -eq 0 ] && [ -n "$SSID" ]; then
-    _raw="$("$TSHARK" -r "$PCAP" \
+    _raw="$("$TSHARK" "${TSHARK_QUIET[@]}" -r "$PCAP" \
       -Y "(wlan.fc.type_subtype==5 || wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
       -T fields -E aggregator=, -e wlan.bssid -e wlan.rsn.akms.type 2>/dev/null | tr -d '\r')"
     mapfile -t TGT_BSSIDS < <(printf '%s\n' "$_raw" | cut -f1 | drop_group | sort -u | grep .)
@@ -2434,7 +2447,7 @@ keymaterial() {
 # command beside its result, redacts secrets by default, and writes a matching
 # evidence-qualified draw.io diagram.
 report() {
-  local out="${1:-wifiscope_${SSID:-report}.md}" mapout="${1:-wifiscope_${SSID:-report}.md}"
+  local out="${1:-${SSID:-report}_analysis.md}" mapout="${1:-${SSID:-report}_analysis.md}"
   mapout="${mapout%.md}.drawio"
   local generated row_limit secrets_label decrypt_label
   # Dynamically scoped so report_command -> print_tshark_command renders the key set
@@ -2798,12 +2811,16 @@ report() {
         printf "- **%s**: %s, %s MAC%s, seen in %d frame(s)\n", m, v, t, g, C[m]+0 }')"
 
   # $probe_all_rows is already  mac<TAB>count<TAB>ssid-set  from the pass above.
-  probe_selectors="$(printf '%s\n' "$probe_all_rows" | awk -F'\t' -v aps="${ALL_BSSIDS[*]}" '
+  # Emit a TABLE sorted busiest-first, not a bullet per station: on a real capture this
+  # is ~70 rows that are identical apart from the address, and as bullets it buried
+  # every section around it. Sorting by probe count puts the station that sent 54 at
+  # the top, where the one that sent 2 is noise.
+  probe_selectors="$(printf '%s\n' "$probe_all_rows" | awk -F'\t' -v OFS='\t' -v aps="${ALL_BSSIDS[*]}" '
       BEGIN{ n=split(aps,a," "); for(i=1;i<=n;i++) AP[tolower(a[i])]=1 }
       $1!="" && !($1 in AP) {
-        printf "- **%s**: %s MAC, %d probe request(s)%s\n", $1,
-          ((tolower(substr($1,2,1)) ~ /^[26ae]$/) ? "randomized" : "hardware"), $2,
-          ($3==""?"":", sought: " $3) }' | sort)"
+        print $1, ((tolower(substr($1,2,1)) ~ /^[26ae]$/) ? "randomized" : "hardware"),
+              $2+0, ($3==""?"—":$3) }' |
+    LC_ALL=C sort -t"$(printf '\t')" -k3,3nr -k1,1)"
 
   # Wired = a MAC that owns an IP in the decrypted L2 traffic but is neither an AP,
   # nor a wireless station of this BSS, nor the default gateway. Seeing a device's
@@ -2853,12 +2870,12 @@ report() {
     printf "ssid: '%s'\n" "${SSID//\'/\'\'}"
     printf "pcap: '%s'\n" "${PCAP//\'/\'\'}"
     printf "generated_utc: '%s'\n" "$generated"
-    printf "wifiscope_version: '%s'\n" "$VERSION"
+    printf "tool_version: '%s'\n" "$VERSION"
     printf "decryption_enabled: '%s'\n" "$decrypt_label"
     printf "secret_values: '%s'\n" "$secrets_label"
     printf "row_limit_per_event_table: %s\n" "$row_limit"
     printf "diagram: '%s'\n" "${mapout##*/}"
-    echo 'tags: [wiboc, wifi, pcap, autopsy, wifiscope]'
+    echo 'tags: [wiboc, wifi, pcap, autopsy]'
     echo '---'
     echo
     echo "# $op_name Mission Report"
@@ -3029,10 +3046,10 @@ KEYS_TMPL
       printf '  -Y %s\n' "'(dhcp || arp || ip || ipv6)'"
       echo '```'
       echo
-      printf '_Or drop the same `type<TAB>value` lines into `%s` and WiFiScope reapplies them on every run._\n' "${KEYRING##*/}"
+      printf '_Or keep the same `type<TAB>value` lines in `%s`; they are reapplied on every run._\n' "${KEYRING##*/}"
       echo
     elif [ "${#DEC[@]}" -gt 0 ]; then
-      printf '_%s decryption key(s) are loaded but withheld here (`WIFISCOPE_REPORT_SECRETS=0`). The values are in `%s`._\n' "${#DEC[@]}" "${KEYRING##*/}"
+      printf '_%s decryption key(s) are loaded but withheld here. The values are in `%s`._\n' "${#DEC[@]}" "${KEYRING##*/}"
       echo
     fi
     echo '> [!tip] `wpa-pwd` is a passphrase and only works for WPA2-PSK. A `tk` decrypts exactly one client session and a `gtk` decrypts broadcast/multicast — those are what you need on an SAE (WPA3) network, where the passphrase cannot produce the PMK. Section 6 records which of these Wireshark actually accepted.'
@@ -3060,7 +3077,7 @@ KEYS_TMPL
     fi
     md_details_open 'How this was derived with TShark'
     echo '```bash'
-    echo '# 4-way messages per station (msgnr 1..4); WiFiScope folds them into a mask:'
+    echo '# 4-way messages per station (msgnr 1..4), folded into a per-station mask:'
     echo "tshark -r '${PCAP##*/}' -Y 'eapol && $(bssid_filter)' \\"
     echo "  -T fields -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr"
     echo
@@ -3078,7 +3095,16 @@ KEYS_TMPL
     echo
     echo '### Associated MACs'
     echo
-    if [ -n "$assoc_selectors" ]; then printf '%s\n' "$assoc_selectors"; else echo '_None observed._'; fi
+    if [ -n "$assoc_selectors" ]; then
+      local _an; _an="$(printf '%s\n' "$assoc_selectors" | grep -c '^- ')"
+      printf '%s\n' "$assoc_selectors" | head -n "$row_limit"
+      [ "$_an" -gt "$row_limit" ] && {
+        echo
+        printf '_Showing the first %s of %s associated station(s); raise the report row limit to list them all._\n' "$row_limit" "$_an"
+      }
+    else
+      echo '_None observed._'
+    fi
     echo
     echo '_"Randomized" means the U/L bit is set (a locally administered address): the device is rotating its MAC and cannot be correlated to another session. "Hardware" means a real OUI, which can._'
     echo
@@ -3116,14 +3142,17 @@ KEYS_TMPL
     echo '### Probing MACs'
     echo
     if [ -n "$probe_selectors" ]; then
-      local _pn; _pn="$(printf '%s\n' "$probe_selectors" | grep -c '^- ')"
-      printf '%s\n' "$probe_selectors" | head -n "$row_limit"
-      echo
-      if [ "$_pn" -gt "$row_limit" ]; then
-        printf '_Showing the first %s of %s probing station(s); raise `WIFISCOPE_REPORT_ROW_LIMIT` to list them all._\n' "$row_limit" "$_pn"
-      else
-        printf '_%s probing station(s)._\n' "$_pn"
-      fi
+      local _pn _prand _phw _pmax
+      _pn="$(printf '%s\n' "$probe_selectors" | grep -c '[^[:space:]]')"
+      _prand="$(printf '%s\n' "$probe_selectors" | awk -F'\t' '$2=="randomized"' | grep -c .)"
+      _phw=$((_pn - _prand))
+      _pmax="$(printf '%s\n' "$probe_selectors" | awk -F'\t' 'NR==1{print $3" probes from "$1}')"
+      printf '**%s station(s)** probed for this network — %s randomized, %s with a real OUI. Busiest: %s.\n' \
+        "$_pn" "$_prand" "$_phw" "$_pmax"
+      printf '%s\n' "$probe_selectors" | head -n "$row_limit" |
+        md_table $'Station\tMAC type\tProbes\tSSID sought'
+      [ "$_pn" -gt "$row_limit" ] &&
+        printf '_Showing the %s busiest of %s probing station(s); raise the report row limit to list them all._\n' "$row_limit" "$_pn"
     else
       echo '_None observed — no station probed for this SSID or addressed one of its BSSIDs._'
     fi
@@ -3136,25 +3165,23 @@ KEYS_TMPL
     echo "tshark -r '${PCAP##*/}' \\"
     echo "  -Y 'wlan.fc.type_subtype==4 && (wlan.ssid==\"$SSID\" || $(bssid_filter))' \\"
     echo "  -T fields -e wlan.sa -e wlan.ssid"
-    echo '# wlan.ssid is hex under -T fields; WiFiScope decodes it to text and'
-    echo '# counts probes per station.'
+    echo '# wlan.ssid is hex under -T fields; it is decoded to text and'
+    echo '# counted per station.'
     echo '```'
     md_details_close
 
     echo '# Actions Taken'
     echo
-    echo '<!-- Operator log: what was done, when, and under what authority. -->'
+    echo '_Operator log — what was done, when, and under what authority._'
     echo
-    printf -- '- %s — capture `%s` (%s bytes, SHA-256 `%s`) analysed with WiFiScope %s\n' \
-      "$generated" "${PCAP##*/}" "$capture_bytes" "$capture_hash" "$VERSION"
+    printf -- '- %s — capture `%s` (%s bytes, SHA-256 `%s`) analysed\n' \
+      "$generated" "${PCAP##*/}" "$capture_bytes" "$capture_hash"
     printf -- '- Decryption: %s%s\n' "$decrypt_label" \
       "$([ "$keyring_count" -gt 0 ] && printf ' (%s key(s) in %s)' "$keyring_count" "${KEYRING##*/}" || printf '')"
     echo
     echo '# Notes'
     echo
-    echo '<!-- Free-form operator notes. Everything below this line is machine-generated evidence. -->'
-    echo
-    echo '---'
+    echo '_Free-form notes. Everything from here on is generated from the capture._'
     echo
     echo '# Detailed evidence'
     echo
@@ -3164,7 +3191,7 @@ KEYS_TMPL
     echo
     printf '| Item | Result | Confidence |\n| --- | --- | --- |\n'
     printf '| Target | %s (%d beaconing BSSID(s)) | Observed |\n' "$SSID" "${#TGT_BSSIDS[@]}"
-    printf '| Security | %s | Observed RSN/privacy fields; interpretation by WiFiScope |\n' "$verdict"
+    printf '| Security | %s | Observed RSN/privacy fields; verdict is interpretation, not observation |\n' "$verdict"
     printf '| Wireless stations | %s station/BSSID observation(s) | Observed; evidence source shown below |\n' "$station_count"
     printf '| Recoverable handshakes | %s station/BSSID context(s) | M1+M2 or M2+M3 observed |\n' "$handshake_good"
     printf '| Decrypted L3 sanity | %s matching DHCP/ARP/IP/IPv6 frame(s) | %s |\n' "$decrypt_count" "$([ "$decrypt_count" -gt 0 ] && echo 'Validated' || echo 'Not validated')"
@@ -3190,7 +3217,7 @@ KEYS_TMPL
     printf '%s\n' "$beacon_rows" | md_table $'BSSID\tSSID\tResolved BSSID\tBand\tAdvertised channel\tCapture frequency MHz\tAvg beacon RSSI dBm\tMin RSSI\tMax RSSI\tRSSI samples'
     echo
     echo '_Advertised DS/HT channel is AP evidence. Radiotap frequency is collector metadata and can vary during channel hopping._'
-    report_command 0 'table_rows  # then group by BSSID; WiFiScope calculates RSSI min/avg/max' \
+    report_command 0 'table_rows  # then group by BSSID; RSSI min/avg/max computed per BSSID' \
       -Y "$(beacons_of_target)" -T fields -E separator=/t -E occurrence=f -E header=y \
       -e frame.time -e wlan.bssid -e wlan.bssid_resolved -e wlan.ssid \
       -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \
@@ -3293,9 +3320,9 @@ KEYS_TMPL
     printf '%s\n' "$keyring_rows" | md_table $'Key type\tWhat it is\tValue'
     echo
     if [ "$report_secrets" = 1 ]; then
-      echo "> [!warning] This report includes full key material (passphrase, PMK, PTK, GTK). Set \`WIFISCOPE_REPORT_SECRETS=0\` to redact it before sharing outside a controlled training artifact."
+      echo "> [!warning] This report includes full key material (passphrase, PMK, PTK, GTK). Re-run with key redaction enabled before sharing it outside a controlled artifact."
     else
-      echo "> [!note] Key material is redacted in this report (\`WIFISCOPE_REPORT_SECRETS=0\`). Counts are shown instead of values; re-run without that variable to include them."
+      echo "> [!note] Key material is redacted in this report. Counts are shown instead of values; re-run with redaction disabled to include them."
     fi
     echo; echo '### PTK components selected/derived by Wireshark'
     printf '%s\n' "$key_analysis_rows" | md_table $'Frame\tTime\tBSSID\tStation\tMessage\tReplay counter\tPMK\tKCK\tKEK\tTK'
@@ -3338,7 +3365,7 @@ KEYS_TMPL
     echo; echo '## 8. Wireless station, management-action, and topology evidence'
     echo; echo '### Station inventory with evidence source'
     printf '%s\n' "$station_rows" | md_table $'Station\tBSSID\tEvidence source(s)'
-    echo '_WiFiScope unions the four result sets below, then removes group-addressed MACs and known AP BSSIDs._'
+    echo '_The four result sets below are unioned, then group-addressed MACs and known AP BSSIDs are removed._'
     report_command 0 'table_unique' -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e wlan.sa -e wlan.bssid
     report_command 0 'table_unique' -Y "eapol && $(bssid_filter)" \
@@ -3410,7 +3437,7 @@ KEYS_TMPL
     printf '%s\n' "$fp_ttl_rows" | md_table $'Source IP\tMax TTL seen\tLikely initial TTL\tLikely stack\tPackets'
     echo
     echo '> [!note] TTL is a hint, not proof. Stacks ship distinct initial values (64 for Linux/Android/macOS/iOS/BSD, 128 for Windows, 255 for network gear and printers), but any router in the path decrements it, so a lower observed value does not by itself change the verdict.'
-    report_command 1 'table_rows  # then WiFiScope takes the max TTL per source' \
+    report_command 1 'table_rows  # then the max TTL per source is taken' \
       -Y "$(bssid_filter) && ip" -T fields -E separator=/t -E header=y -e ip.src -e ip.ttl
 
     echo; echo '## 10. Decrypted DNS and software evidence'
@@ -3663,7 +3690,7 @@ EOF
       c|clearkey)   clearkey ;;
       m|map)        printf 'drawio file [%s.drawio]: ' "${SSID:-net}"; read -e -r f; need_all_bssids; map "${f:-}" ;;
       M|mapall)     printf 'drawio file [network.drawio]: '; read -e -r f; need_all_bssids; mapall "${f:-}" ;;
-      r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; need_all_bssids; report "${f:-}" ;;
+      r)            printf 'report file [%s_analysis.md]: ' "${SSID:-report}"; read -e -r f; need_all_bssids; report "${f:-}" ;;
       q|quit)       break ;;
       *)            note "unknown choice: $c" ;;
     esac
