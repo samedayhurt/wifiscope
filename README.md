@@ -164,6 +164,7 @@ already answered. The SSID is still verified to exist, with a probe that stops a
 | `XXD` | Path to `xxd` for hex/binary stream conversion |
 | `PYTHON3` | Python3 executable used only inside `report` |
 | `WIFISCOPE_REPORT_ROW_LIMIT=N` | Cap long event tables in a report (default `500`; summary counts still use all frames) |
+| `WIFISCOPE_NO_PROGRESS=1` | Suppress the live progress line (it is already off automatically whenever stderr is not a terminal) |
 | `WIFISCOPE_JOBS=N` | Max concurrent `tshark` passes in `report`/`fingerprint`. Default is derived from cpu count, free memory, **and capture size** (~capture+256 MB budgeted per pass, spending at most 70% of free RAM). Raise it on a big host; lower it to `1`–`2` on a small VM |
 | `WIFISCOPE_REPORT_SECRETS=0` | Redact key values in the report (counts only). Keys are **included by default** — an autopsy of your own lab capture is not much use without them |
 | `WIFISCOPE_AUTHOR` | `author:` in the report frontmatter (default: `$USER`) |
@@ -188,6 +189,20 @@ exhaust a small VM and wedge it. So the number in flight is capped, sized from c
 count, free memory, and the size of the capture actually loaded (roughly
 capture + 256 MB budgeted per concurrent pass, spending at most 70% of free RAM).
 Override with `WIFISCOPE_JOBS`.
+
+While the passes run, a live line on **stderr** shows how many have finished, with a
+spinner and elapsed time, so a multi-minute run on a large capture is visibly
+working rather than indistinguishable from a hang:
+
+```
+  collecting evidence: 29 tshark passes over 254 MB, 4 at a time — leave it running
+  \ ━━━━━━━━━━━━━━━━━━━━━━━···  26/29 passes  01:12
+  ✓ evidence collected (29 passes) in 01:19
+  · assembling tables and diagram…
+```
+
+It is stderr-only and terminal-only, so reports, pipes and redirects stay byte-clean.
+`WIFISCOPE_NO_PROGRESS=1` turns it off explicitly.
 
 Concurrency never changes the output — the report is assembled from the completed
 passes afterwards, so `WIFISCOPE_JOBS=1` and `WIFISCOPE_JOBS=16` produce identical

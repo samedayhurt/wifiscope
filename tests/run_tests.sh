@@ -120,6 +120,38 @@ for _p in fpcap:wifi_generation fpttl:ttl_os_hint macseen:awk probe_all:awk; do
   else bad "$_f is not aggregated in-pass - temp file would grow with packet count"; fi
 done
 
+# The progress bar's denominator is a literal, so it silently goes wrong the moment
+# someone adds or removes a pass. Assert it still matches the real gate count, and
+# that progress stays terminal-only so reports and pipes cannot be polluted.
+echo "== progress indicator is consistent and terminal-only =="
+_rpt_gates="$(awk '/^report\(\) \{/,/^\}$/' "$WS" | grep -c '^  _jobgate$')"
+_rpt_total="$(grep -m1 -oE 'local _pg_total=[0-9]+' "$WS" | grep -oE '[0-9]+')"
+if [ "$_rpt_gates" = "$_rpt_total" ]; then ok "report progress total ($_rpt_total) matches its $_rpt_gates gated passes"
+else bad "report progress total is $_rpt_total but there are $_rpt_gates gated passes"; fi
+_fp_gates="$(awk '/^fingerprint\(\) \{/,/^\}$/' "$WS" | grep -c '^  _jobgate$')"
+_fp_total="$(awk '/^fingerprint\(\) \{/,/^\}$/' "$WS" | grep -m1 -oE '_progress_start [0-9]+' | grep -oE '[0-9]+')"
+if [ "$_fp_gates" = "$_fp_total" ]; then ok "fingerprint progress total ($_fp_total) matches its $_fp_gates gated passes"
+else bad "fingerprint progress total is $_fp_total but there are $_fp_gates gated passes"; fi
+grep -q 'PG_ON=0' "$WS" && grep -q '\[ -t 2 \]' "$WS" && ok "progress is gated on stderr being a terminal" || bad "progress is not tty-gated"
+grep -q 'WIFISCOPE_NO_PROGRESS' "$WS" && ok "WIFISCOPE_NO_PROGRESS opt-out exists" || bad "no progress opt-out"
+# Progress must never reach the report or a redirected stderr. Run in a scratch dir
+# with an ABSOLUTE script path, and assert the run actually produced a report -
+# otherwise a failed invocation makes the leak checks pass vacuously.
+_wsabs="$PWD/wifiscope.sh"
+_pgdir="$TMP/pgcheck"; mkdir -p "$_pgdir"
+_perr="$_pgdir/stderr.txt"
+( cd "$_pgdir" && NO_COLOR=1 TSHARK="$TSHARK" "$_wsabs" report "$PCAP" MainNet >/dev/null 2>"$_perr" )
+_pgmd="$_pgdir/wifiscope_MainNet.md"
+if [ -s "$_pgmd" ]; then
+  ok "progress leak check actually produced a report to inspect"
+  if grep -qE '━|leave it running|passes complete' "$_perr"; then bad "progress leaked into redirected stderr"
+  else ok "no progress output when stderr is not a terminal"; fi
+  if grep -qE '━|leave it running' "$_pgmd"; then bad "progress leaked into the report"
+  else ok "no progress output in the report file"; fi
+else
+  bad "progress leak check could not generate a report ($_pgmd missing)"
+fi
+
 echo "== all display commands survive a no-decryption capture =="
 for _c in recon bands crypto hardware clients keys topology hosts probes handshakes fingerprint pmkid; do
   _out="$(NO_COLOR=1 TSHARK="$TSHARK" "$WS" "$_c" "$PCAP" MainNet 2>&1)"

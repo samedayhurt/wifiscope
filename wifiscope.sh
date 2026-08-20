@@ -98,15 +98,99 @@ ws_size_jobs() {
   fi
 }
 
+# ---- progress ---------------------------------------------------------------
+# A capped fan-out over a large capture legitimately runs for minutes with nothing
+# on screen, which is indistinguishable from a hang - the honest answer to "is it
+# stuck?" was previously "no idea, wait and see". So render a live line while the
+# passes run. Rules: STDERR only (so reports, pipes and redirects stay byte-clean),
+# real terminal only, and its own colour globals - report() deliberately blanks
+# C_* to keep its Markdown plain, and that must not reach into this.
+PG_ON=0
+[ -t 2 ] && [ -z "${WIFISCOPE_NO_PROGRESS:-}" ] && PG_ON=1
+if [ "$PG_ON" = 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  PG_DIM=$'\e[2m'; PG_CYN=$'\e[36m'; PG_GRN=$'\e[32m'; PG_RST=$'\e[0m'
+else
+  PG_DIM=''; PG_CYN=''; PG_GRN=''; PG_RST=''
+fi
+PG_TOTAL=0        # passes expected in the current fan-out
+PG_T0=0           # SECONDS at fan-out start
+PG_SPIN=0
+WS_LAUNCHED=0     # passes launched so far (incremented by _jobgate)
+
+# _progress_start TOTAL LABEL: announce a fan-out and say plainly that it is
+# expected to take a while, so nobody kills it thinking it wedged.
+_progress_start() {
+  PG_TOTAL="$1"; PG_T0=$SECONDS; PG_SPIN=0; WS_LAUNCHED=0
+  [ "$PG_ON" = 1 ] || return 0
+  local mb=0
+  [ -n "$PCAP" ] && [ -f "$PCAP" ] &&
+    mb=$(( $(stat -c %s "$PCAP" 2>/dev/null || echo 0) / 1024 / 1024 ))
+  printf '%s  %s: %d tshark passes over %d MB, %d at a time — leave it running%s\n' \
+    "$PG_DIM" "${2:-collecting evidence}" "$PG_TOTAL" "$mb" "$WS_JOBS" "$PG_RST" >&2
+}
+
+# _progress_tick DONE: repaint the single status line in place.
+_progress_tick() {
+  [ "$PG_ON" = 1 ] || return 0
+  [ "$PG_TOTAL" -gt 0 ] || return 0
+  local done="$1" w=26 i f bar el sp
+  [ "$done" -lt 0 ] && done=0
+  [ "$done" -gt "$PG_TOTAL" ] && done="$PG_TOTAL"
+  f=$(( done * w / PG_TOTAL ))
+  bar=''
+  for ((i = 0; i < w; i++)); do
+    if [ "$i" -lt "$f" ]; then bar+='━'; else bar+='·'; fi
+  done
+  sp='|/-\'
+  PG_SPIN=$(( (PG_SPIN + 1) % 4 ))
+  el=$(( SECONDS - PG_T0 ))
+  printf '\r\033[2K%s  %s %s%s%s  %d/%d passes  %02d:%02d%s' \
+    "$PG_DIM" "${sp:$PG_SPIN:1}" "$PG_CYN" "$bar" "$PG_DIM" \
+    "$done" "$PG_TOTAL" "$((el / 60))" "$((el % 60))" "$PG_RST" >&2
+}
+
+# _progress_done MSG: clear the status line and leave one settled summary behind.
+_progress_done() {
+  [ "$PG_ON" = 1 ] || return 0
+  local el=$(( SECONDS - PG_T0 ))
+  printf '\r\033[2K%s  ✓ %s in %02d:%02d%s\n' \
+    "$PG_GRN" "${1:-all passes complete}" "$((el / 60))" "$((el % 60))" "$PG_RST" >&2
+}
+
+# _progress_phase MSG: name the stage that runs after the passes, so the last
+# stretch (awk assembly, diagram generation) is not silent either.
+_progress_phase() {
+  [ "$PG_ON" = 1 ] || return 0
+  printf '%s  · %s%s\n' "$PG_DIM" "$1" "$PG_RST" >&2
+}
+
 # _jobgate: block until fewer than WS_JOBS background jobs remain, so a fan-out of
 # any size runs at a bounded width. Call it immediately before each `... &` launch.
+#   It polls rather than using `wait -n` so the progress line keeps animating while
+#   we are at capacity - which is where nearly the whole run is spent. The 0.25s
+#   granularity is irrelevant next to multi-second passes.
 _jobgate() {
   local n
   while :; do
     n="$(jobs -rp | grep -c .)"
-    [ "$n" -lt "$WS_JOBS" ] && return 0
-    wait -n 2>/dev/null || sleep 0.2
+    [ "$n" -lt "$WS_JOBS" ] && break
+    _progress_tick "$(( WS_LAUNCHED - n ))"
+    sleep 0.25
   done
+  WS_LAUNCHED=$((WS_LAUNCHED + 1))
+  _progress_tick "$(( WS_LAUNCHED - 1 - n ))"
+}
+
+# _wait_progress: drain the remaining jobs, still animating, then reap them.
+_wait_progress() {
+  local n
+  while :; do
+    n="$(jobs -rp | grep -c .)"
+    [ "$n" -eq 0 ] && break
+    _progress_tick "$(( WS_LAUNCHED - n ))"
+    sleep 0.25
+  done
+  wait
 }
 
 # ---- color / UX -------------------------------------------------------------
@@ -1468,6 +1552,7 @@ fingerprint() {
   section "🔎 device fingerprinting for $SSID"
   ws_size_jobs
   local D; D="$(mktemp -d)"
+  _progress_start 7 "fingerprinting"
   # shellcheck disable=SC2064
   trap "rm -rf '$D'" RETURN
 
@@ -1508,7 +1593,8 @@ fingerprint() {
   { tqd "${l_args[@]}" 2>/dev/null | ttl_os_hint; } > "$D/ttl" &
   _jobgate
   { tqd "${b_args[@]}" 2>/dev/null | sort -u; } > "$D/banner" &
-  wait
+  _wait_progress
+  _progress_done "fingerprint passes complete"
 
   subsection "802.11 client capability profile  (no decryption needed)"
   show_cmd 0 "${a_args[@]}"
@@ -2338,6 +2424,12 @@ report() {
   tshark_has_field tls.handshake.ja4 && { ja_f+=(-e tls.handshake.ja4); tls_hdr+=$'\tJA4'; }
   local assoc_f="(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\""
   D="$(mktemp -d)"
+  # 29 gated passes, minus the two that only run when their fields exist. A test
+  # asserts this constant still matches the number of _jobgate calls in report().
+  local _pg_total=29
+  [ "$has_gps" = 1 ] || _pg_total=$((_pg_total - 1))
+  [ "$has_tk"  = 1 ] || _pg_total=$((_pg_total - 1))
+  _progress_start "$_pg_total" "collecting evidence"
 
   _jobgate
   { tq -T fields -E occurrence=f -e frame.number -e frame.time_epoch -e frame.time -e frame.cap_len -e frame.len \
@@ -2461,7 +2553,9 @@ report() {
   { tq -q -z io,phs; } > "$D/phs_plain" &
   _jobgate
   { tqd -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp; } > "$D/l3stats" &
-  wait
+  _wait_progress
+  _progress_done "evidence collected ($_pg_total passes)"
+  _progress_phase "assembling tables and diagram…"
 
   # ---- assemble from the completed passes (cheap AWK/bash only, no more tshark) ----
   local frame_stats capture_bytes capture_hash truncated_count retry_count phs_plain l3stats
