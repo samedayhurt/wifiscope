@@ -24,6 +24,10 @@ tool doubles as a way to learn the queries.
 
 ## Features
 
+- **Fast start** — name the target on the command line (`./wifiscope.sh cap.pcapng SSID [pass]`) and
+  startup skips both prompts *and* the whole-capture SSID enumeration behind the picker. The
+  existence check stops reading at the first matching beacon instead of scanning to EOF, and the
+  whole-capture BSSID index is built only when a command actually needs it. ~2x faster to the menu.
 - **Recon** — protocol hierarchy + every SSID/BSSID/channel/band in the capture (2.4 / 5 / **6 GHz**).
 - **Per-network analysis** — bands/channels, encryption (full RSN AKM verdict: WPA2/WPA3-Personal,
   **Enterprise 802.1X**, OWE, Suite-B, transition, WPA1/WEP/open), make/model (from WPS), wireless
@@ -33,6 +37,17 @@ tool doubles as a way to learn the queries.
   still show up. Hidden SSIDs are surfaced and their names recovered from probe responses.
 - **Host inventory** (post-decryption) — subnet/gateway, IPv4 **and IPv6** (ARP + ICMPv6 ND / DHCPv6),
   IP↔MAC, hostnames, OS/software versions.
+- **Device fingerprinting** (`fingerprint`) — what the clients *are*, not just their addresses:
+  802.11 capability profile (vendor OUI, **randomized-vs-hardware MAC**, Wi-Fi 4/5/6/6E generation)
+  with **no keys required**, plus — once decrypting — the **DHCP option-55** parameter-request
+  signature, **TLS SNI + JA3/JA4**, DNS-SD/mDNS service and `model=` strings, and a TTL-based
+  stack hint. Every pass runs concurrently.
+- **WPA3 / SAE** — SAE, FT-SAE, **SAE group-dependent hash (R3)**, OWE, Suite-B-192 and FILS in the
+  AKM verdict; AKM and cipher selectors decoded to names (`SAE`, `GCMP-256`) instead of bare
+  numbers; **PMF/802.11w** state called out (and flagged when SAE is advertised without it); the SAE
+  Commit/Confirm exchange listed from Authentication frames; H2E and transition-disable detection.
+  Critically, it **tells you a passphrase cannot decrypt an SAE-only BSS** — the SAE PMK comes from
+  the elliptic-curve exchange, not `PBKDF2(passphrase, SSID)` — instead of silently decrypting nothing.
 - **Key harvesting & keyring** — derive the PSK, compute each client's PTK-TK, scrape GTKs, and
   persist them to a per-capture keyring that auto-applies to every later query. Import/add keys from
   other tools (hcxtools, hostapd, oxide) to decrypt BSSes whose handshake you didn't capture.
@@ -46,10 +61,16 @@ tool doubles as a way to learn the queries.
 - **Whole-network map** (`mapall`) — map the *entire* capture at once: every physical AP appears
   once with all the SSIDs it radiates (main / guest / IoT), so you see the deployment, not one
   ESSID at a time.
-- **Evidence reports** — generate an Obsidian-ready Markdown autopsy plus a matching map. Reports
-  contain an executive summary, capture hash/timing, radio/security/WPS/OUI evidence, EAPOL and
-  PMKID analysis, decryption validation, TK/GTK context, L3/host/DNS inventory, management events,
-  quality checks, limitations, open questions, and the exact command beside every result.
+- **Mission reports** — an Obsidian-ready Markdown report that **answers the operational questions
+  first**: Survey Imagery, Router Info (make / model / firmware / per-band MACs / channels /
+  frequencies / encryption / estimated location / strongest RSSI), Handshakes, and Selectors of
+  Interest (**Associated**, **Wired**, and **Probing** MACs, each annotated with OUI, randomized-or-
+  hardware, and times seen), plus operator `Actions Taken` / `Notes` blocks. Every block carries the
+  exact tshark commands that produced it. A `# Detailed evidence` half then follows with 12 numbered
+  sections — executive summary, capture hash/timing, radio/security/WPS/OUI evidence, EAPOL + PMKID
+  + **SAE** analysis, decryption validation, **full key inventory (PSK/PMK, PTK-TK, GTK) with a
+  plain-English "what it is" column**, L3/host/DNS inventory, device fingerprinting, management
+  events, quality checks and open questions — with a linked table of contents.
 - **Evidence-qualified maps** — the diagram distinguishes observed links from inferred roles. An
   AP is called a gateway only after an exact DHCP-router-IP → ARP-MAC → beacon-BSSID match; a
   DHCP default gateway is never mislabeled as an Internet/ISP address.
@@ -82,9 +103,15 @@ chmod +x wifiscope.sh
 **Interactive** (menu, with filename tab-completion at the prompts):
 
 ```bash
-./wifiscope.sh                 # asks for a pcap, then shows the menu
-./wifiscope.sh capture.pcapng  # pcap preloaded
+./wifiscope.sh                             # asks for a pcap, then shows the menu
+./wifiscope.sh capture.pcapng              # pcap preloaded, picker + passphrase prompt
+./wifiscope.sh capture.pcapng HomeNet          # FAST: skip the picker, straight to the menu
+./wifiscope.sh capture.pcapng HomeNet hunter2  # FAST: also skip the passphrase prompt
 ```
+
+Naming the target skips `pick_ssid`, which otherwise reads the whole capture twice (once for beacon
+SSIDs, once for hidden-AP BSSIDs) plus one more full pass per hidden AP — just to draw a list you
+already answered. The SSID is still verified to exist, with a probe that stops at the first match.
 
 **One-shot** (scriptable — first arg is the command):
 
@@ -112,7 +139,8 @@ chmod +x wifiscope.sh
 | `topology` | AP count + 802.11 WDS backhaul (mesh detection) |
 | `hosts` | Subnet, IP↔MAC, hostnames, versions (needs a key) |
 | `probes` | Directed probe requests: client → SSID sought |
-| `handshakes` | Per-client 4-way completeness + crackable flag |
+| `handshakes` | Per-client 4-way completeness + crackable flag, **and the WPA3 SAE Commit/Confirm exchange** |
+| `fingerprint` | Device identification: 802.11 capability profile (vendor, randomized MAC, Wi-Fi generation) + DHCP option-55, TLS SNI/JA3/JA4, DNS-SD `model=`, TTL stack hint |
 | `pmkid` | List RSN PMKIDs (offline-crackable) |
 | `export22000` | Write a `hashcat -m 22000` file |
 | `harvest` | Derive PSK + compute PTK-TKs + scrape GTKs → keyring |
@@ -136,13 +164,17 @@ chmod +x wifiscope.sh
 | `XXD` | Path to `xxd` for hex/binary stream conversion |
 | `PYTHON3` | Python3 executable used only inside `report` |
 | `WIFISCOPE_REPORT_ROW_LIMIT=N` | Cap long event tables in a report (default `500`; summary counts still use all frames) |
-| `WIFISCOPE_REPORT_SECRETS=1` | Include literal keys in a controlled training report; default reports redact values |
+| `WIFISCOPE_REPORT_SECRETS=0` | Redact key values in the report (counts only). Keys are **included by default** — an autopsy of your own lab capture is not much use without them |
+| `WIFISCOPE_AUTHOR` | `author:` in the report frontmatter (default: `$USER`) |
+| `WIFISCOPE_OPNAME` | Operation name — becomes `<OPNAME> Mission Report` in the title (default: the SSID) |
 
 ```bash
 TSHARK=/opt/wireshark/bin/tshark ./wifiscope.sh recon capture.pcapng
 NO_COLOR=1 ./wifiscope.sh crypto capture.pcapng HomeNet     # plain text
 WIFISCOPE_REPORT_ROW_LIMIT=1000 ./wifiscope.sh report capture.pcapng HomeNet
-WIFISCOPE_REPORT_SECRETS=1 ./wifiscope.sh report capture.pcapng HomeNet  # training artifact only
+WIFISCOPE_REPORT_SECRETS=0 ./wifiscope.sh report capture.pcapng HomeNet  # redact key material
+WIFISCOPE_AUTHOR='J. Doe' WIFISCOPE_OPNAME=NIGHTJAR \
+  ./wifiscope.sh report capture.pcapng HomeNet hunter2   # -> "NIGHTJAR Mission Report"
 ```
 
 ## The keyring & decryption model
@@ -178,9 +210,12 @@ WiFiScope reports intentionally use three evidence levels:
 - **Not observed** — the evidence was not present in this capture. This never means the feature,
   host, or activity did not exist.
 
-Normal reports never print passphrases, PSKs, TKs, or GTKs. The TShark command blocks preserve the
-full decryption-option structure but replace values with `REDACTED`. Use `keymaterial`, or opt in
-with `WIFISCOPE_REPORT_SECRETS=1`, only for a controlled training artifact.
+Reports **include** the recovered key material by default — passphrase, PSK/PMK, PTK-TK and GTK —
+in section 6, each row labelled with what that key actually is and what it decrypts. That is the
+point of an autopsy of your own capture. Set `WIFISCOPE_REPORT_SECRETS=0` to redact before sharing
+outside a controlled artifact: the inventory then shows per-type counts instead of values, and the
+TShark command blocks keep the full decryption-option structure with a `<passphrase>:<SSID>`
+placeholder in place of real records.
 
 ## Tests
 
