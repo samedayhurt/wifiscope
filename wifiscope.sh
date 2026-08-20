@@ -1657,6 +1657,38 @@ pmkid() {
 #   Uses hcxpcapngtool when present (handles PMKID *and* EAPOL handshakes fully).
 #   Without it, falls back to building PMKID (WPA*01) lines directly — reliable,
 #   though EAPOL (*02) lines then need hcxpcapngtool.
+# _hc22000_build OUT: write hashcat-22000 lines to OUT and echo the method used.
+#   Quiet, and deliberately incapable of aborting the caller: report() calls this, and
+#   the old inline `need "$XXD"` would have called die() and killed a report that was
+#   otherwise fine just because xxd was missing.
+#   hcxpcapngtool handles PMKID (WPA*01) *and* EAPOL (WPA*02). Without it we can still
+#   build PMKID lines by hand; EAPOL lines need the MIC/nonce packing hcxpcapngtool
+#   does, so we say so rather than emitting a half-file that looks complete.
+_hc22000_build() {
+  local out="$1"
+  : > "$out" 2>/dev/null || return 1
+  if command -v hcxpcapngtool >/dev/null 2>&1; then
+    hcxpcapngtool -o "$out" "$PCAP" >/dev/null 2>&1
+    if [ -s "$out" ]; then printf 'hcxpcapngtool (PMKID + EAPOL)'; return 0; fi
+    rm -f "$out"; return 1
+  fi
+  command -v "$XXD" >/dev/null 2>&1 || { rm -f "$out"; return 1; }
+  local ehex; ehex="$(printf '%s' "$SSID" | "$XXD" -p -c 999999 | tr -d '\r\n')"
+  tq -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
+     -e wlan.bssid -e wlan.staa -e wlan.rsn.ie.pmkid \
+    | awk -F'\t' -v e="$ehex" '$3!="" && $3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
+        printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | LC_ALL=C sort -u > "$out"
+  if [ -s "$out" ]; then printf 'built-in PMKID only (install hcxpcapngtool for EAPOL/WPA*02)'; return 0; fi
+  rm -f "$out"; return 1
+}
+
+# hc22000_kind: label each hashcat line by what it actually is, so a reader knows
+#   which are client-less (PMKID) and which came from a 4-way.
+hc22000_kind() {
+  awk -F'*' '/^WPA\*/{ k=($2=="01")?"PMKID (client-less)":(($2=="02")?"EAPOL 4-way":"WPA*" $2)
+                       printf "%s\t%s\t%s\n", k, toupper($4), toupper($5) }'
+}
+
 export22000() {
   local out="${1:-${PCAP%.*}.hc22000}"
   # hashcat -m 22000 recovers a PASSPHRASE. That only means anything where the PMK
@@ -1666,21 +1698,13 @@ export22000() {
     note "⚠ $SSID is WPA3-SAE only — hashcat -m 22000 cannot recover an SAE passphrase from this."
     note "  SAE is not offline-crackable this way; capture/derive a PTK-TK or GTK instead ('h' harvest)."
   fi
-  if command -v hcxpcapngtool >/dev/null 2>&1; then
-    hcxpcapngtool -o "$out" "$PCAP" >/dev/null 2>&1
-    [ -s "$out" ] && ok "wrote $(hlink "file://$out" "$out")  (hcxpcapngtool: PMKID + EAPOL)" ||
-      note "hcxpcapngtool found nothing to export"
-    return
+  local how
+  if how="$(_hc22000_build "$out")"; then
+    ok "wrote $(hlink "file://$out" "$out")  ($(grep -c . "$out") line(s) via $how)"
+  else
+    note "nothing to export — no PMKID or EAPOL material this build can package"
+    command -v hcxpcapngtool >/dev/null 2>&1 || note "  (hcxpcapngtool is not installed; it would also package EAPOL handshakes)"
   fi
-  note "hcxpcapngtool not installed — exporting PMKID (WPA*01) lines only"
-  need "$XXD"
-  local ehex; ehex="$(printf '%s' "$SSID" | "$XXD" -p -c 999999 | tr -d '\r\n')"
-  ts -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
-     -e wlan.bssid -e wlan.staa -e wlan.rsn.ie.pmkid \
-    | awk -F'\t' -v e="$ehex" '$3!="" && $3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
-        printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | sort -u > "$out"
-  if [ -s "$out" ]; then ok "wrote $(hlink "file://$out" "$out")  ($(grep -c . "$out") PMKID line(s))"
-  else note "no PMKIDs in this capture to export"; rm -f "$out"; fi
 }
 
 # probes: what SSIDs each client is actively looking for (directed probe requests).
@@ -2332,12 +2356,20 @@ md_table() {
 # report_command DECRYPT PIPELINE ARGS...: print the command that produced the
 # adjacent report block.  PIPELINE is documentary (e.g. "LC_ALL=C sort -u").
 # Key values are redacted by default; WIFISCOPE_REPORT_SECRETS=1 opts in.
+# md_details_open LABEL / md_details_close: Obsidian is stricter than GitHub about an
+#   HTML block that wraps fenced code. It wants the tags on their OWN lines with a
+#   blank line between the tag and the markdown inside. Written inline as
+#   "<details><summary>x</summary>" with the fence butted straight against
+#   "</details>", the fence leaks out of the HTML block and every following section
+#   renders as one run-on blob. These helpers are the only place that shape is decided.
+md_details_open() { printf '<details>\n<summary>%s</summary>\n\n' "$1"; }
+md_details_close() { printf '\n</details>\n\n'; }
+
 report_command() {
   local decrypt="$1" pipeline="$2" redact=1 rendered; shift 2
   [ "${WIFISCOPE_REPORT_SECRETS:-1}" = 1 ] && redact=0
   rendered="$(print_tshark_command "$decrypt" "$redact" "$@")"
-  echo '<details><summary>Reproduce with TShark</summary>'
-  echo
+  md_details_open 'Reproduce with TShark'
   echo '```bash'
   if [ -n "$pipeline" ]; then
     printf '%s\n' "$rendered" | sed '1s/^\$ //' | sed '$s/$/ \\/'
@@ -2346,7 +2378,7 @@ report_command() {
     printf '%s\n' "$rendered" | sed '1s/^\$ //'
   fi
   echo '```'
-  echo '</details>'
+  md_details_close
 }
 
 sha256_file() {
@@ -2545,7 +2577,12 @@ report() {
                               END{for(m in c) print m, c[m]}'; } > "$D/macseen" &
   # Every directed probe request in the capture, with the SSID sought and a count.
   _jobgate
-  { tq -Y 'wlan.fc.type_subtype==4' -T fields -e wlan.sa -e wlan.ssid | dessid 2 |
+  # Probes aimed at THIS network only: a probe request naming our SSID, or one
+  # directed at one of our BSSIDs. Unscoped, this listed every probing device in the
+  # capture - 731 of them on a busy merge - which buried the section it belongs to and
+  # answered a question nobody asked. The whole-capture view still exists in section 8.
+  { tq -Y "wlan.fc.type_subtype==4 && (wlan.ssid==\"$SSID\" || $(bssid_filter))" \
+      -T fields -e wlan.sa -e wlan.ssid | dessid 2 |
       awk -F'\t' -v OFS='\t' '$1!="" { m=tolower($1); c[m]++
                                  if($2!="" && !seen[m SUBSEP $2]++) s[m]=s[m] (s[m]?", ":"") $2 }
                               END{for(m in c) print m, c[m], s[m]}'; } > "$D/probe_all" &
@@ -2774,6 +2811,22 @@ report() {
         if(tolower(substr(m,2,1)) ~ /[13579bdf]/) next          # group-addressed
         if(!(seen[m]++)) printf "- **%s**: %s — no association or handshake seen, so wired (or on another BSS)\n", m, $2 }' | sort)"
 
+  # Hashcat export, produced by the same button that produces the report - the whole
+  # point of the handshake evidence is the file you can actually crack, so writing the
+  # report without it left a manual step that is easy to forget.
+  local hcout hc_how hc_lines hc_body hc_kinds
+  hcout="${out%.md}.hc22000"
+  hc_how=''; hc_lines=0; hc_body=''; hc_kinds=''
+  if hc_how="$(_hc22000_build "$hcout")"; then
+    hc_lines="$(grep -c . "$hcout" 2>/dev/null || echo 0)"
+    hc_kinds="$(hc22000_kind < "$hcout" | LC_ALL=C sort | uniq -c |
+                  awk '{n=$1; $1=""; sub(/^ /,""); print n" x "$0}')"
+    if [ "$report_secrets" = 1 ]; then hc_body="$(cat "$hcout")"; fi
+  else
+    hc_how=''
+  fi
+  _progress_phase "wrote $(basename "$hcout") (${hc_lines} hash line(s))"
+
   # Dynamic scope: the report is always plain Markdown, independent of terminal UX.
   local C_RESET= C_B= C_DIM= C_RED= C_GRN= C_YEL= C_BLU= C_MAG= C_CYN= C_ORG= UX_LINKS=0
   {
@@ -2822,8 +2875,7 @@ report() {
     echo '| 11 | [Capture-quality checks](#11-capture-quality-checks) | How much should we trust the above? |'
     echo '| 12 | [Limitations, gaps, and questions](#12-limitations-gaps-and-questions) | What this capture cannot tell us. |'
     echo
-    echo '<details><summary>Paste once: table helpers + key set used by the commands below</summary>'
-    echo
+    md_details_open 'Paste once: table helpers + key set used by the commands below'
     echo '```bash'
     cat <<'REPORT_HELPERS'
 # Align TSV when util-linux `column` is installed; otherwise preserve plain TSV.
@@ -2860,8 +2912,7 @@ KEYS=(
 KEYS_TMPL
     fi
     echo '```'
-    echo '</details>'
-    echo
+    md_details_close
     # ---- MISSION REPORT: the answers first, evidence tables afterwards -------
     # Everything here is a summary of the numbered sections below; each block names
     # the tshark command that produced it so a reader can re-derive any single line.
@@ -2901,8 +2952,7 @@ KEYS_TMPL
     echo
     echo '> [!note] Estimated Location is the **collector** position recorded on the strongest beacon, not a survey fix on the AP. Make/model/firmware come from what the AP advertises about itself; an AP with an empty WPS IE states nothing, which is why those lines can be blank on a perfectly healthy capture.'
     echo
-    echo '<details><summary>How this was derived with TShark</summary>'
-    echo
+    md_details_open 'How this was derived with TShark'
     echo '```bash'
     echo '# Identity (make / model / firmware) — WPS is where an AP names itself:'
     echo "tshark -r '${PCAP##*/}' -Y '$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.os_version)' \\"
@@ -2923,7 +2973,53 @@ KEYS_TMPL
     echo "tshark -r '${PCAP##*/}' -Y 'ppi_gps.lat && ppi_gps.lon && $(beacons_of_target)' \\"
     echo "  -T fields -e ppi_gps.lat -e ppi_gps.lon -e ppi_gps.alt -e ppi.80211-common.dbm.antsignal"
     echo '```'
-    echo '</details>'
+    md_details_close
+
+    # Key material lives here as well as in section 6 on purpose: section 6 is the
+    # validation record, this is the operational recipe - everything needed to decrypt
+    # this capture again in six months, next to the router it belongs to.
+    echo '### Key Material — how to decrypt this capture later'
+    if [ "$keyring_count" -gt 0 ]; then
+      printf '%s\n' "$keyring_rows" | md_table $'Key type\tWhat it is\tValue'   # emits its own blank line
+    else
+      echo
+      echo '_Keyring is empty — nothing stored for this capture yet. Run `harvest` to derive the PSK/PTK-TK, or `addkey` to import material from another tool._'
+      echo
+    fi
+    # Keys Wireshark derived from the handshakes themselves (PMK / KCK / KEK / TK),
+    # and the group keys carried in message 3. These are per-session, so they are the
+    # ones that matter when the passphrase alone will not do — notably under SAE.
+    local _derived
+    _derived="$({
+      printf '%s\n' "$key_analysis_rows" | awk -F'\t' -v OFS='\t' \
+        '$10!=""{print "PTK-TK", $3, $4, $10} $7!=""{print "PMK", $3, $4, $7}'
+      printf '%s\n' "$gtk_rows" | awk -F'\t' -v OFS='\t' \
+        '$9!=""{print "GTK", $5, "(group)", $9} $12!=""{print "IGTK", $5, "(group)", $12} $15!=""{print "BIGTK", $5, "(group)", $15}'
+    } | grep '[^[:space:]]' | LC_ALL=C sort -u)"
+    if [ -n "$_derived" ]; then
+      echo '**Derived from the handshakes in this capture:**'
+      printf '%s\n' "$_derived" | md_table $'Key\tBSSID\tStation\tValue'
+    fi
+    if [ "${#DEC[@]}" -gt 0 ] && [ "$report_secrets" = 1 ]; then
+      echo 'Paste this to decrypt the capture again with exactly the keys used here:'
+      echo
+      echo '```bash'
+      printf 'tshark -r %s \\\n' "${PCAP##*/}"
+      local _i=0
+      while [ "$_i" -lt "${#DEC[@]}" ]; do
+        printf '  %s %s \\\n' "${DEC[$_i]}" "$(shell_quote_human "${DEC[$((_i + 1))]}")"
+        _i=$((_i + 2))
+      done
+      printf '  -Y %s\n' "'(dhcp || arp || ip || ipv6)'"
+      echo '```'
+      echo
+      printf '_Or drop the same `type<TAB>value` lines into `%s` and WiFiScope reapplies them on every run._\n' "${KEYRING##*/}"
+      echo
+    elif [ "${#DEC[@]}" -gt 0 ]; then
+      printf '_%s decryption key(s) are loaded but withheld here (`WIFISCOPE_REPORT_SECRETS=0`). The values are in `%s`._\n' "${#DEC[@]}" "${KEYRING##*/}"
+      echo
+    fi
+    echo '> [!tip] `wpa-pwd` is a passphrase and only works for WPA2-PSK. A `tk` decrypts exactly one client session and a `gtk` decrypts broadcast/multicast — those are what you need on an SAE (WPA3) network, where the passphrase cannot produce the PMK. Section 6 records which of these Wireshark actually accepted.'
     echo
 
     echo '### Handshakes'
@@ -2933,14 +3029,20 @@ KEYS_TMPL
     printf -- '- **PMKID rows:** %s\n' "$pmkid_count"
     printf -- '- **SAE (WPA3) auth frames:** %s\n' "$sae_count"
     printf -- '- **Keys held:** %s\n' "$([ "$keyring_count" -gt 0 ] && printf '%s (see §6)' "$keyring_count" || printf 'none')"
+    if [ -n "$hc_how" ]; then
+      printf -- '- **hashcat-22000 export:** `%s` — %s line(s) via %s\n' "${hcout##*/}" "$hc_lines" "$hc_how"
+      [ -n "$hc_kinds" ] && printf '%s\n' "$hc_kinds" | sed 's/^/    - /'
+      printf -- '- **Crack with:** `hashcat -m 22000 %s wordlist.txt`\n' "${hcout##*/}"
+    else
+      printf -- '- **hashcat-22000 export:** _nothing exportable (no PMKID, and no EAPOL packer available)_\n'
+    fi
     echo
     printf '%s\n' "$hs_rows" | md_table $'Station\tBSSID\tMessages 1–4\tPTK/offline-check context usable'
     if [ "$sae_count" -gt 0 ]; then
       echo '> [!important] SAE frames are present. An SAE PMK comes from the elliptic-curve exchange, not from `PBKDF2(passphrase, SSID)` — so for SAE sessions the passphrase cannot decrypt and the 4-way above is not offline-crackable. Harvested PTK-TK / GTK material is required.'
       echo
     fi
-    echo '<details><summary>How this was derived with TShark</summary>'
-    echo
+    md_details_open 'How this was derived with TShark'
     echo '```bash'
     echo '# 4-way messages per station (msgnr 1..4); WiFiScope folds them into a mask:'
     echo "tshark -r '${PCAP##*/}' -Y 'eapol && $(bssid_filter)' \\"
@@ -2954,8 +3056,7 @@ KEYS_TMPL
     echo "tshark -r '${PCAP##*/}' -Y 'wlan.fixed.auth.alg==3 && $(bssid_filter)' \\"
     echo "  -T fields -e wlan.sa -e wlan.da -e $sae_mt -e wlan.fixed.status_code"
     echo '```'
-    echo '</details>'
-    echo
+    md_details_close
 
     echo '## Selectors of Interest'
     echo
@@ -2965,8 +3066,7 @@ KEYS_TMPL
     echo
     echo '_"Randomized" means the U/L bit is set (a locally administered address): the device is rotating its MAC and cannot be correlated to another session. "Hardware" means a real OUI, which can._'
     echo
-    echo '<details><summary>How this was derived with TShark</summary>'
-    echo
+    md_details_open 'How this was derived with TShark'
     echo '```bash'
     echo '# Association evidence (a station that asked to join this SSID):'
     echo "tshark -r '${PCAP##*/}' -Y '(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"' \\"
@@ -2979,8 +3079,7 @@ KEYS_TMPL
     echo '# Times seen = every frame to or from the MAC inside the target BSS:'
     echo "tshark -r '${PCAP##*/}' -Y '$(bssid_filter)' -T fields -e wlan.sa -e wlan.da"
     echo '```'
-    echo '</details>'
-    echo
+    md_details_close
 
     echo '### Wired MACs'
     echo
@@ -2988,8 +3087,7 @@ KEYS_TMPL
     echo
     echo '_A MAC that owns an IP in the decrypted traffic but never associated and never handshaked is reached over cable — or sits on a BSS this capture did not cover. The default gateway is excluded; it is reported separately in the executive summary._'
     echo
-    echo '<details><summary>How this was derived with TShark</summary>'
-    echo
+    md_details_open 'How this was derived with TShark'
     echo '```bash'
     echo '# MAC<->IP ownership from ARP, from the DHCP lease, and from IPv6 ND:'
     echo "tshark -r '${PCAP##*/}' \"\${KEYS[@]}\" -Y '$(bssid_filter) && (arp || dhcp || (icmpv6 && icmpv6.opt.linkaddr))' \\"
@@ -2997,24 +3095,35 @@ KEYS_TMPL
     echo "  -e icmpv6.opt.linkaddr -e ipv6.src"
     echo '# ...then subtract every BSSID, every associated station, and the gateway.'
     echo '```'
-    echo '</details>'
-    echo
+    md_details_close
 
     echo '### Probing MACs'
     echo
-    if [ -n "$probe_selectors" ]; then printf '%s\n' "$probe_selectors"; else echo '_None observed._'; fi
+    if [ -n "$probe_selectors" ]; then
+      local _pn; _pn="$(printf '%s\n' "$probe_selectors" | grep -c '^- ')"
+      printf '%s\n' "$probe_selectors" | head -n "$row_limit"
+      echo
+      if [ "$_pn" -gt "$row_limit" ]; then
+        printf '_Showing the first %s of %s probing station(s); raise `WIFISCOPE_REPORT_ROW_LIMIT` to list them all._\n' "$row_limit" "$_pn"
+      else
+        printf '_%s probing station(s)._\n' "$_pn"
+      fi
+    else
+      echo '_None observed — no station probed for this SSID or addressed one of its BSSIDs._'
+    fi
     echo
-    echo '_Directed probe requests name the SSIDs a device is looking for — including networks that are not present here. That list is a travel history, and it is broadcast in the clear with no association required._'
+    echo '_These are stations hunting for **this** network specifically: a probe request naming the SSID, or one directed at one of its BSSIDs. A device that probes for a network it is not currently connected to has been on it before, and that is broadcast in the clear with no association required. For every probing device in the capture regardless of target, see section 8._'
     echo
-    echo '<details><summary>How this was derived with TShark</summary>'
-    echo
+    md_details_open 'How this was derived with TShark'
     echo '```bash'
-    echo '# Every directed probe request in the capture (subtype 4 with a named SSID):'
-    echo "tshark -r '${PCAP##*/}' -Y 'wlan.fc.type_subtype==4' -T fields -e wlan.sa -e wlan.ssid"
-    echo '# wlan.ssid is hex under -T fields; WiFiScope decodes it to text.'
+    echo '# Probe requests (subtype 4) that name THIS SSID or target one of its BSSIDs:'
+    echo "tshark -r '${PCAP##*/}' \\"
+    echo "  -Y 'wlan.fc.type_subtype==4 && (wlan.ssid==\"$SSID\" || $(bssid_filter))' \\"
+    echo "  -T fields -e wlan.sa -e wlan.ssid"
+    echo '# wlan.ssid is hex under -T fields; WiFiScope decodes it to text and'
+    echo '# counts probes per station.'
     echo '```'
-    echo '</details>'
-    echo
+    md_details_close
 
     echo '# Actions Taken'
     echo
@@ -3024,12 +3133,10 @@ KEYS_TMPL
       "$generated" "${PCAP##*/}" "$capture_bytes" "$capture_hash" "$VERSION"
     printf -- '- Decryption: %s%s\n' "$decrypt_label" \
       "$([ "$keyring_count" -gt 0 ] && printf ' (%s key(s) in %s)' "$keyring_count" "${KEYRING##*/}" || printf '')"
-    echo '-'
     echo
     echo '# Notes'
     echo
     echo '<!-- Free-form operator notes. Everything below this line is machine-generated evidence. -->'
-    echo '-'
     echo
     echo '---'
     echo
@@ -3118,6 +3225,34 @@ KEYS_TMPL
     report_command 0 'table_unique' -Y "$(bssid_filter) && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)" \
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e frame.time \
       -e wlan.fc.type_subtype -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid
+
+    echo; echo '### hashcat-22000 export'
+    echo
+    if [ -n "$hc_how" ]; then
+      printf 'Written alongside this report as [`%s`](%s) — %s line(s), via %s.\n' \
+        "${hcout##*/}" "${hcout##*/}" "$hc_lines" "$hc_how"
+      echo
+      printf '%s\n' "$hc_kinds" | md_table $'Count\tKind'
+      if [ -n "$hc_body" ]; then
+        echo '```'
+        printf '%s\n' "$hc_body"
+        echo '```'
+        echo
+      else
+        echo '_Hash lines withheld (`WIFISCOPE_REPORT_SECRETS=0`); the file itself still contains them._'
+        echo
+      fi
+      echo '```bash'
+      printf 'hashcat -m 22000 %s wordlist.txt\n' "${hcout##*/}"
+      echo '```'
+      echo
+      echo '> [!note] `WPA*01` lines are PMKID and need no client; `WPA*02` lines come from a 4-way handshake. Both recover the **passphrase**, so they are only meaningful where the PMK is `PBKDF2(passphrase, SSID)` — i.e. WPA2-PSK, not SAE.'
+    else
+      echo '_No exportable hash material: no PMKID in the capture, and no EAPOL packer available on this host._'
+      echo
+      command -v hcxpcapngtool >/dev/null 2>&1 ||
+        echo '_Install `hcxpcapngtool` to package EAPOL handshakes as `WPA*02` lines as well._'
+    fi
 
     echo; echo '### SAE (WPA3) authentication exchange'
     printf '%s\n' "$sae_rows" | md_table $'Frame\tTime\tSource\tDestination\tBSSID\tSAE message (1=Commit, 2=Confirm)\tStatus code'

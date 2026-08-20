@@ -197,6 +197,45 @@ assert_has "unproven AP is a root candidate" "ROOT CANDIDATE" <<<"$(cat "$RMAP")
 assert_lacks "map never invents an ISP/WAN" "Internet / ISP" <<<"$(cat "$RMAP")"
 assert_lacks "map never claims an unproved gateway" "ROOT / GATEWAY" <<<"$(cat "$RMAP")"
 
+# Obsidian is stricter than GitHub about HTML blocks wrapping fenced code: the tags
+# need their own lines with blank lines around the markdown inside, or the fence leaks
+# out and every following section renders as one run-on blob.
+echo "== report markdown is Obsidian-safe =="
+assert_lacks "no inline <details><summary> on one line" "<details><summary>" <<<"$(cat "$REPORT")"
+_dopen="$(grep -c '^<details>$' "$REPORT")"; _dclose="$(grep -c '^</details>$' "$REPORT")"
+[ "$_dopen" = "$_dclose" ] && [ "$_dopen" -gt 0 ] \
+  && ok "details tags are balanced and on their own lines ($_dopen pairs)" \
+  || bad "details tags unbalanced: $_dopen open vs $_dclose close"
+awk '/^```/{n++} END{exit (n%2)}' "$REPORT" \
+  && ok "code fences are balanced" || bad "code fences are unbalanced"
+# A blank line must separate a fence close from </details>, else Obsidian mis-nests.
+if grep -B1 '^</details>$' "$REPORT" | grep -q '^```$'; then
+  bad "a fence close butts directly against </details>"
+else ok "every </details> is preceded by a blank line"; fi
+assert_lacks "no empty '-' list items" $'\n-\n' <<<"$(cat "$REPORT")"
+
+echo "== handshake hashes are exported by the report =="
+assert_has "report has a hashcat-22000 section" "### hashcat-22000 export" <<<"$(cat "$REPORT")"
+assert_has "mission block reports the hashcat export" "**hashcat-22000 export:**" <<<"$(cat "$REPORT")"
+grep -q '^_hc22000_build() {' "$WS" && ok "_hc22000_build helper exists" || bad "_hc22000_build missing"
+# It must never abort its caller the way the old inline `need "$XXD"` could.
+awk '/^_hc22000_build\(\) \{/,/^\}$/' "$WS" | grep -q 'need ' \
+  && bad "_hc22000_build can still die() via need" \
+  || ok "_hc22000_build cannot abort the report"
+
+echo "== decrypt recipe sits with the router info AND stays in section 6 =="
+assert_has "Key Material block next to Router Info" "### Key Material" <<<"$(cat "$REPORT")"
+assert_has "section 6 key inventory still present" "### Stored keyring inventory" <<<"$(cat "$REPORT")"
+assert_has "recipe names the keyring file" "reapplies them on every run" <<<"$(cat "$REPORT")"
+
+echo "== probing MACs are scoped to the selected target =="
+assert_has "probing section explains the scoping" "hunting for **this** network" <<<"$(cat "$REPORT")"
+awk '/> "\$D\/probe_all" &/{found=1} /wlan.fc.type_subtype==4/{if(!seen){seen=1}} END{}' "$WS" >/dev/null
+if grep -B6 '> "\$D/probe_all" &' "$WS" | grep -q 'wlan.ssid==' ; then
+  ok "probe_all pass filters on the selected SSID/BSSID"
+else bad "probe_all pass is still capture-wide"; fi
+
+
 echo
 echo "passed=$PASS failed=$FAIL"
 [ "$FAIL" -eq 0 ]
