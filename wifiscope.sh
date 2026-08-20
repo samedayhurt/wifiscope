@@ -36,7 +36,6 @@ TSHARK="${TSHARK:-tshark}"
 OPENSSL="${OPENSSL:-openssl}"
 XXD="${XXD:-xxd}"
 
-<<<<<<< Updated upstream
 PCAP=""              # capture file we're working on
 SSID=""             # the target network name (once selected)
 PASS=""             # WPA passphrase (optional, for decryption)
@@ -46,23 +45,6 @@ TGT_BSSIDS=()       # every BSSID advertising the target SSID
 ALL_BSSIDS=()       # every BSSID in the whole capture (used to spot non-AP MACs)
 TSHARK_FIELD_NAMES="" # lazily cached `tshark -G fields` abbreviations
 TSHARK_FIELDS_LOADED=0
-||||||| Stash base
-PCAP=""              # capture file we're working on
-SSID=""             # the target network name (once selected)
-PASS=""             # WPA passphrase (optional, for decryption)
-DEC=()              # tshark decryption args, REBUILT from the keyring (empty = off)
-KEYRING=""          # path to <pcap>.keys — the harvested key store (UAT lines)
-TGT_BSSIDS=()       # every BSSID advertising the target SSID
-ALL_BSSIDS=()       # every BSSID in the whole capture (used to spot non-AP MACs)
-=======
-PCAP=""       # capture file we're working on
-SSID=""       # the target network name (once selected)
-PASS=""       # WPA passphrase (optional, for decryption)
-DEC=()        # tshark decryption args, REBUILT from the keyring (empty = off)
-KEYRING=""    # path to <pcap>.keys — the harvested key store (UAT lines)
-TGT_BSSIDS=() # every BSSID advertising the target SSID
-ALL_BSSIDS=() # every BSSID in the whole capture (used to spot non-AP MACs)
->>>>>>> Stashed changes
 
 # ---- color / UX -------------------------------------------------------------
 # Color + clickable links turn ON for a real terminal (or WIFISCOPE_FORCE_COLOR=1)
@@ -379,7 +361,6 @@ set_key() {
 #  every tshark call rebuilds its decryption args from it.
 # =============================================================================
 
-<<<<<<< Updated upstream
 # kr_normalize TYPE VALUE: the single source of truth for what tshark will accept
 #   as a  -o uat:80211_keys:"type","value"  record. On success it prints the
 #   normalized "type<TAB>value" and returns 0; on failure it prints a human reason
@@ -412,29 +393,6 @@ kr_normalize() {
     *) printf "unknown key type '%s'" "$t"; return 1 ;;
   esac
   printf '%s\t%s' "$t" "$v"
-||||||| Stash base
-# kr_add TYPE VALUE: append a key to the keyring, skipping exact duplicates.
-#   TYPE is a tshark UAT key type: wpa-pwd | wpa-psk | tk | wep | msk.
-#   Stored as "type<TAB>value" so values containing ':' (wpa-pwd) stay intact.
-kr_add() {
-  local line; line="$(printf '%s\t%s' "$1" "$2")"
-  [ -n "$KEYRING" ] || { note "no keyring path set (load a pcap first)"; return; }
-  touch "$KEYRING"
-  grep -Fxq "$line" "$KEYRING" 2>/dev/null || printf '%s\n' "$line" >> "$KEYRING"
-=======
-# kr_add TYPE VALUE: append a key to the keyring, skipping exact duplicates.
-#   TYPE is a tshark UAT key type: wpa-pwd | wpa-psk | tk | wep | msk.
-#   Stored as "type<TAB>value" so values containing ':' (wpa-pwd) stay intact.
-kr_add() {
-  local line
-  line="$(printf '%s\t%s' "$1" "$2")"
-  [ -n "$KEYRING" ] || {
-    note "no keyring path set (load a pcap first)"
-    return
-  }
-  touch "$KEYRING"
-  grep -Fxq "$line" "$KEYRING" 2>/dev/null || printf '%s\n' "$line" >>"$KEYRING"
->>>>>>> Stashed changes
 }
 
 # kr_add TYPE VALUE: append a key to the keyring, validating it FIRST (so garbage
@@ -457,7 +415,6 @@ rebuild_dec() {
   DEC=(-o wlan.enable_decryption:TRUE)
   local t v norm skipped=0
   while IFS=$'\t' read -r t v; do
-<<<<<<< Updated upstream
     [ -n "$t$v" ] || continue
     if norm="$(kr_normalize "$t" "$v")"; then
       DEC+=(-o "uat:80211_keys:\"${norm%%$'\t'*}\",\"${norm#*$'\t'}\"")
@@ -467,15 +424,6 @@ rebuild_dec() {
   done < "$KEYRING"
   [ "$skipped" -gt 0 ] && note "keyring: $skipped bad entr$([ "$skipped" = 1 ] && echo y || echo ies) ignored — decryption still uses the valid keys"
   return 0
-||||||| Stash base
-    [ -n "$t" ] || continue
-    DEC+=(-o "uat:80211_keys:\"$t\",\"$v\"")
-  done < "$KEYRING"
-=======
-    [ -n "$t" ] || continue
-    DEC+=(-o "uat:80211_keys:\"$t\",\"$v\"")
-  done <"$KEYRING"
->>>>>>> Stashed changes
 }
 
 # pmk_hex: compute the 256-bit PMK/PSK from passphrase + SSID (WPA2-PSK).
@@ -514,7 +462,6 @@ derive_psk() {
 #   ANonce comes from msg1/msg3 (AP side), SNonce from msg2 (STA side) — all
 #   cleartext in the EAPOL frames, so no decryption is needed to read them.
 harvest_ptk() {
-<<<<<<< Updated upstream
   [ -n "$PASS" ] && [ -n "$SSID" ] || { note "need passphrase+SSID for PTKs"; return; }
   need "$OPENSSL"; need "$XXD"
   local pmk contexts
@@ -550,115 +497,11 @@ harvest_ptk() {
     done
     [ "${#prfhex}" -ge 96 ] || continue
     tk="${prfhex:64:32}"                         # bytes 32..47 of the 48-byte PTK
-||||||| Stash base
-  [ -n "$PASS" ] && [ -n "$SSID" ] || { note "need passphrase+SSID for PTKs"; return; }
-  local pmk; pmk="$(pmk_hex)"
-  # IMPORTANT: python must read the tshark rows on STDIN, so the program cannot
-  # also come from stdin — `python3 -` would consume the here-doc instead of the
-  # piped data. Load the script into a variable and pass it with `python3 -c`.
-  local PTK_PY
-  read -r -d '' PTK_PY <<'PY'
-import sys, hmac, hashlib, binascii
-pmk = binascii.unhexlify(sys.argv[1])
-mac = lambda m: binascii.unhexlify(m.replace(':', ''))
-def prf(key, A, B, n):                       # IEEE 802.11 PRF using HMAC-SHA1
-    R = b''; i = 0
-    while len(R) < n:
-        R += hmac.new(key, A + b'\x00' + B + bytes([i]), hashlib.sha1).digest(); i += 1
-    return R[:n]
-S = {}
-for ln in sys.stdin:
-    p = ln.rstrip('\n').split('\t')
-    if len(p) < 4 or not p[3]:               # need a nonce
-        continue
-    sa, da, m, nh = p[0], p[1], p[2], p[3]
-    try: n = binascii.unhexlify(nh)
-    except Exception: continue
-    if m in ('1', '3'): ap, sta, an, sn = sa, da, n, None   # AP sends ANonce
-    elif m == '2':      ap, sta, an, sn = da, sa, None, n    # STA sends SNonce
-    else: continue
-    e = S.setdefault((ap, sta), {'an': None, 'sn': None})
-    if an: e['an'] = an
-    if sn: e['sn'] = sn
-for (ap, sta), e in S.items():
-    if not (e['an'] and e['sn']): continue   # need both nonces
-    aa, spa = mac(ap), mac(sta)
-    B = min(aa, spa) + max(aa, spa) + min(e['an'], e['sn']) + max(e['an'], e['sn'])
-    tk = prf(pmk, b'Pairwise key expansion', B, 48)[32:48]
-    print('%s\t%s\t%s' % (sta, ap, binascii.hexlify(tk).decode()))
-PY
-  local out
-  out="$(ts -Y "wlan_rsna_eapol.keydes.msgnr in {1,2,3} && $(bssid_filter)" -T fields \
-        -e wlan.sa -e wlan.da -e wlan_rsna_eapol.keydes.msgnr -e wlan_rsna_eapol.keydes.nonce \
-        | "$PYBIN" -c "$PTK_PY" "$pmk")"
-  [ -n "$out" ] || { note "no complete handshakes (need both nonces) to derive PTKs"; return; }
-  local sta ap tk
-  while IFS=$'\t' read -r sta ap tk; do
-    [ -n "$tk" ] || continue
-=======
-  [ -n "$PASS" ] && [ -n "$SSID" ] || {
-    note "need passphrase+SSID for PTKs"
-    return
-  }
-  local pmk
-  pmk="$(pmk_hex)"
-  # IMPORTANT: python must read the tshark rows on STDIN, so the program cannot
-  # also come from stdin — `python3 -` would consume the here-doc instead of the
-  # piped data. Load the script into a variable and pass it with `python3 -c`.
-  local PTK_PY
-  read -r -d '' PTK_PY <<'PY'
-import sys, hmac, hashlib, binascii
-pmk = binascii.unhexlify(sys.argv[1])
-mac = lambda m: binascii.unhexlify(m.replace(':', ''))
-def prf(key, A, B, n):                       # IEEE 802.11 PRF using HMAC-SHA1
-    R = b''; i = 0
-    while len(R) < n:
-        R += hmac.new(key, A + b'\x00' + B + bytes([i]), hashlib.sha1).digest(); i += 1
-    return R[:n]
-S = {}
-for ln in sys.stdin:
-    p = ln.rstrip('\n').split('\t')
-    if len(p) < 4 or not p[3]:               # need a nonce
-        continue
-    sa, da, m, nh = p[0], p[1], p[2], p[3]
-    try: n = binascii.unhexlify(nh)
-    except Exception: continue
-    if m in ('1', '3'): ap, sta, an, sn = sa, da, n, None   # AP sends ANonce
-    elif m == '2':      ap, sta, an, sn = da, sa, None, n    # STA sends SNonce
-    else: continue
-    e = S.setdefault((ap, sta), {'an': None, 'sn': None})
-    if an: e['an'] = an
-    if sn: e['sn'] = sn
-for (ap, sta), e in S.items():
-    if not (e['an'] and e['sn']): continue   # need both nonces
-    aa, spa = mac(ap), mac(sta)
-    B = min(aa, spa) + max(aa, spa) + min(e['an'], e['sn']) + max(e['an'], e['sn'])
-    tk = prf(pmk, b'Pairwise key expansion', B, 48)[32:48]
-    print('%s\t%s\t%s' % (sta, ap, binascii.hexlify(tk).decode()))
-PY
-  local out
-  out="$(ts -Y "wlan_rsna_eapol.keydes.msgnr in {1,2,3} && $(bssid_filter)" -T fields \
-    -e wlan.sa -e wlan.da -e wlan_rsna_eapol.keydes.msgnr -e wlan_rsna_eapol.keydes.nonce |
-    "$PYBIN" -c "$PTK_PY" "$pmk")"
-  [ -n "$out" ] || {
-    note "no complete handshakes (need both nonces) to derive PTKs"
-    return
-  }
-  local sta ap tk
-  while IFS=$'\t' read -r sta ap tk; do
-    [ -n "$tk" ] || continue
->>>>>>> Stashed changes
     kr_add tk "$tk"
     note "PTK-TK  $sta @ $ap  ->  $tk"
-<<<<<<< Updated upstream
     derived=$((derived+1))
   done <<< "$contexts"
   [ "$derived" -gt 0 ] || note "handshake rows were present, but no PTK passed validation"
-||||||| Stash base
-  done <<< "$out"
-=======
-  done <<<"$out"
->>>>>>> Stashed changes
 }
 
 # harvest_gtk: extract every recoverable GTK for the TARGET SSID as a tk.
@@ -837,17 +680,9 @@ recon() {
   ts -q -z io,phs
   section "📇 all beacons: bssid / ssid / 2.4ch / 5ch / freq"
   ts -Y 'wlan.fc.type_subtype==8' -T fields \
-<<<<<<< Updated upstream
      -e wlan.bssid -e wlan.ssid -e wlan.ds.current_channel \
      -e wlan.ht.info.primarychannel -e radiotap.channel.freq | dessid 2 | sort -u \
      | tcol $'BSSID\tSSID\t2.4GHz ch\t5GHz ch\tFreq MHz'
-||||||| Stash base
-     -e wlan.bssid -e wlan.ssid -e wlan.ds.current_channel \
-     -e wlan.ht.info.primarychannel -e radiotap.channel.freq | dessid 2 | sort -u
-=======
-    -e wlan.bssid -e wlan.ssid -e wlan.ds.current_channel \
-    -e wlan.ht.info.primarychannel -e radiotap.channel.freq | dessid 2 | sort -u
->>>>>>> Stashed changes
 }
 
 # bands: channel + band for each BSSID of the target SSID.
@@ -953,7 +788,6 @@ crypto() {
 #   that DO exist in the capture (neighbors), and (c) sweep decrypted HTTP/UPnP
 #   banners, where router firmware/model frequently leaks from the admin page.
 hardware() {
-<<<<<<< Updated upstream
   local hdr=$'BSSID\tMake\tModel\tModel #\tDevice\tSerial\tFirmware (WPS OS)'
   local wps_all wps_tgt
   # Pull every populated WPS identity in the capture once, then split target vs rest.
@@ -1020,17 +854,6 @@ tcol() {
   else
     printf '%s  (none observed)%s\n' "$C_DIM" "$C_RESET"
   fi
-||||||| Stash base
-  section "🏷️  make / model (WPS) for $SSID"
-  ts -Y "wps.model_name && $(bssid_filter)" -T fields \
-     -e wlan.bssid -e wps.manufacturer -e wps.model_name \
-     -e wps.model_number -e wps.device_name -e wps.serial_number | sort -u
-=======
-  section "🏷️  make / model (WPS) for $SSID"
-  ts -Y "wps.model_name && $(bssid_filter)" -T fields \
-    -e wlan.bssid -e wps.manufacturer -e wps.model_name \
-    -e wps.model_number -e wps.device_name -e wps.serial_number | sort -u
->>>>>>> Stashed changes
 }
 
 # drop_group: filter out group-addressed (broadcast/multicast) MACs from a stream
@@ -1061,35 +884,13 @@ station_macs() {
   # so an aggregated frame can never inflate the distinct-station count.
   {
     ts -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
-<<<<<<< Updated upstream
        -T fields -E occurrence=f -e wlan.sa 2>/dev/null
     ts -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.da 2>/dev/null | tr ',\t' '\n'
-||||||| Stash base
-       -T fields -e wlan.sa 2>/dev/null
-    ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null | tr '\t' '\n'
-=======
-      -T fields -e wlan.sa 2>/dev/null
-    ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null | tr '\t' '\n'
->>>>>>> Stashed changes
     ts -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" \
-<<<<<<< Updated upstream
        -T fields -E occurrence=f -e wlan.sa 2>/dev/null
-||||||| Stash base
-       -T fields -e wlan.sa 2>/dev/null
-=======
-      -T fields -e wlan.sa 2>/dev/null
->>>>>>> Stashed changes
     ts -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" \
-<<<<<<< Updated upstream
        -T fields -E occurrence=f -e wlan.da 2>/dev/null
   } | tr ',\t' '\n' | sort -u | grep . | drop_group | no_aps
-||||||| Stash base
-       -T fields -e wlan.da 2>/dev/null
-  } | tr '\t' '\n' | sort -u | grep . | drop_group | no_aps
-=======
-      -T fields -e wlan.da 2>/dev/null
-  } | tr '\t' '\n' | sort -u | grep . | drop_group | no_aps
->>>>>>> Stashed changes
 }
 
 # clients: list the wireless stations on the target network.
@@ -1099,14 +900,8 @@ station_macs() {
 clients() {
   section "👥 wireless station candidates on $SSID (assoc + data + EAPOL)"
   ts -Y "eapol && $(bssid_filter)" -T fields \
-<<<<<<< Updated upstream
      -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr \
      | tcol $'Frame\tSource\tDestination\tBSSID\tEAPOL msg'
-||||||| Stash base
-     -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr
-=======
-    -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr
->>>>>>> Stashed changes
   section "distinct client MACs (all sources)"
   station_macs | tcol 'Station MAC'
 }
@@ -1165,18 +960,8 @@ keys() {
   echo "PSK/passphrase entries supplied: $stored_psk  (keyring inventory, not proof the key works)"
 
   local nptk
-<<<<<<< Updated upstream
   nptk="$(handshake_summary | awk -F'\t' '$4=="YES"' | wc -l | tr -d ' ')"
   echo "recoverable PTK contexts: $nptk  (station/BSSID pairs with M1+M2 or M2+M3)"
-||||||| Stash base
-  nptk="$(ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null \
-          | tr '\t' '\n' | sort -u | grep . | drop_group | no_aps | wc -l | tr -d ' ')"
-  echo "PTK: $nptk  (one per client that completed a 4-way handshake)"
-=======
-  nptk="$(ts -Y "eapol && $(bssid_filter)" -T fields -e wlan.sa -e wlan.da 2>/dev/null |
-    tr '\t' '\n' | sort -u | grep . | drop_group | no_aps | wc -l | tr -d ' ')"
-  echo "PTK: $nptk  (one per client that completed a 4-way handshake)"
->>>>>>> Stashed changes
   local nsta
   nsta="$(station_macs | wc -l | tr -d ' ')"
   echo "stations seen: $nsta  (all sources — assoc + data + EAPOL; ≥ PTK count)"
@@ -1205,19 +990,9 @@ topology() {
   section "802.11 WDS backhaul (4-address) links: transmitter -> receiver"
   # Drop 4-address frames to a group-addressed receiver (multicast/broadcast) —
   # a real backhaul peer is unicast; the I/G bit (2nd hex digit odd) flags a group.
-<<<<<<< Updated upstream
   ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra \
     | awk -F'\t' '$1!="" && $2!="" && tolower(substr($1,2,1)) !~ /[13579bdf]/ && tolower(substr($2,2,1)) !~ /[13579bdf]/' \
     | sort -u | tcol $'Transmitter\tReceiver'
-||||||| Stash base
-  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra \
-    | awk -F'\t' '$1!="" && $2!="" && tolower(substr($1,2,1)) !~ /[13579bdf]/ && tolower(substr($2,2,1)) !~ /[13579bdf]/' \
-    | sort -u
-=======
-  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra |
-    awk -F'\t' '$1!="" && $2!="" && tolower(substr($1,2,1)) !~ /[13579bdf]/ && tolower(substr($2,2,1)) !~ /[13579bdf]/' |
-    sort -u
->>>>>>> Stashed changes
   section "backhaul frame count"
   ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' | wc -l
   note "count physical APs = distinct units in the backhaul (root + each satellite backhaul-STA)"
@@ -1232,27 +1007,13 @@ hosts() {
   tsd -Y 'arp || ip || ipv6' | wc -l
   section "subnet / gateway (DHCP options 1 & 3)"
   tsd -Y 'dhcp' -T fields \
-<<<<<<< Updated upstream
       -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u \
       | tcol $'Assigned IP\tSubnet mask\tRouter\tHostname'
-||||||| Stash base
-      -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u
-=======
-    -e dhcp.ip.your -e dhcp.option.subnet_mask -e dhcp.option.router -e dhcp.option.hostname | sort -u
->>>>>>> Stashed changes
   section "DHCP fingerprint (mac / ip / hostname / vendor-class)"
   tsd -Y 'dhcp' -T fields \
-<<<<<<< Updated upstream
       -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
       -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u \
       | tcol $'Client MAC\tRequested IP\tAssigned IP\tHostname\tVendor class'
-||||||| Stash base
-      -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-      -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u
-=======
-    -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-    -e dhcp.option.hostname -e dhcp.option.vendor_class_id | sort -u
->>>>>>> Stashed changes
   section "ARP IPv4 <-> MAC"
   tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac | sort -u \
       | tcol $'IPv4\tMAC'
@@ -1261,17 +1022,9 @@ hosts() {
   # the client MAC — without these, every IPv6-only host is missed.
   section "IPv6 neighbors (ICMPv6 ND link-layer option)"
   tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields \
-<<<<<<< Updated upstream
       -e ipv6.src -e icmpv6.opt.linkaddr \
       -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u \
       | tcol $'IPv6 source\tLink-layer MAC\tNS target\tNA target'
-||||||| Stash base
-      -e ipv6.src -e icmpv6.opt.linkaddr \
-      -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u
-=======
-    -e ipv6.src -e icmpv6.opt.linkaddr \
-    -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address | sort -u
->>>>>>> Stashed changes
   section "DHCPv6 (client IPv6 / DUID link-layer MAC)"
   tsd -Y 'dhcpv6' -T fields -e ipv6.src -e dhcpv6.duidll.link_layer_addr | sort -u \
       | tcol $'IPv6 source\tDUID link-layer MAC'
@@ -1279,24 +1032,12 @@ hosts() {
   # dns.resp.name (answers) carries the real host.local a device advertises; qry.name
   # is what a device is *looking for*. Include both — the map keys names off resp.name.
   tsd -Y 'dhcp.option.hostname || nbns || mdns || llmnr' -T fields \
-<<<<<<< Updated upstream
       -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u \
       | tcol $'Source IP\tDHCP hostname\tNBNS name\tmDNS response\tDNS query'
-||||||| Stash base
-      -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u
-=======
-    -e ip.src -e dhcp.option.hostname -e nbns.name -e dns.resp.name -e dns.qry.name | sort -u
->>>>>>> Stashed changes
   section "software versions (HTTP / SSH banners)"
   tsd -Y 'http.user_agent || http.server || ssh.protocol' -T fields \
-<<<<<<< Updated upstream
       -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u \
       | tcol $'Source IP\tHTTP User-Agent\tHTTP Server\tSSH protocol'
-||||||| Stash base
-      -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u
-=======
-    -e ip.src -e http.user_agent -e http.server -e ssh.protocol | sort -u
->>>>>>> Stashed changes
 }
 
 # pmkid: list RSN PMKID evidence.  PMKIDs are commonly carried in association RSN
@@ -1304,19 +1045,11 @@ hosts() {
 #   Zero-valued PMKIDs are filtered out.
 pmkid() {
   section "🪪 PMKIDs (offline-crackable, client-less)"
-<<<<<<< Updated upstream
   ts -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
      -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid \
      -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
     | awk -F'\t' '$5!="" || ($6!="" && $6 !~ /^0*$/)' | sort -u \
     | tcol $'Frame\tSource\tDestination\tBSSID\tPMKID AKM\tPMKID'
-||||||| Stash base
-  ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
-     -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid | awk -F'\t' '$3 !~ /^0*$/' | sort -u
-=======
-  ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
-    -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid | awk -F'\t' '$3 !~ /^0*$/' | sort -u
->>>>>>> Stashed changes
 }
 
 # export22000: write a hashcat-22000 file to crack with:  hashcat -m 22000 <file>
@@ -1332,7 +1065,6 @@ export22000() {
     return
   fi
   note "hcxpcapngtool not installed — exporting PMKID (WPA*01) lines only"
-<<<<<<< Updated upstream
   need "$XXD"
   local ehex; ehex="$(printf '%s' "$SSID" | "$XXD" -p -c 999999 | tr -d '\r\n')"
   ts -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
@@ -1341,28 +1073,6 @@ export22000() {
         printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | sort -u > "$out"
   if [ -s "$out" ]; then ok "wrote $(hlink "file://$out" "$out")  ($(grep -c . "$out") PMKID line(s))"
   else note "no PMKIDs in this capture to export"; rm -f "$out"; fi
-||||||| Stash base
-  local ehex; ehex="$("$PYBIN" -c 'import sys;print(sys.argv[1].encode().hex())' "$SSID")"
-  ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
-     -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid \
-    | awk -F'\t' -v e="$ehex" '$3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
-        printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | sort -u > "$out"
-  if [ -s "$out" ]; then ok "wrote $(hlink "file://$out" "$out")  ($(grep -c . "$out") PMKID line(s))"
-  else note "no PMKIDs in this capture to export"; rm -f "$out"; fi
-=======
-  local ehex
-  ehex="$("$PYBIN" -c 'import sys;print(sys.argv[1].encode().hex())' "$SSID")"
-  ts -Y "eapol && wlan.rsn.ie.pmkid && $(bssid_filter)" -T fields \
-    -e wlan.sa -e wlan.da -e wlan.rsn.ie.pmkid |
-    awk -F'\t' -v e="$ehex" '$3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
-        printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | sort -u >"$out"
-  if [ -s "$out" ]; then
-    ok "wrote $(hlink "file://$out" "$out")  ($(grep -c . "$out") PMKID line(s))"
-  else
-    note "no PMKIDs in this capture to export"
-    rm -f "$out"
-  fi
->>>>>>> Stashed changes
 }
 
 # probes: what SSIDs each client is actively looking for (directed probe requests).
@@ -1370,47 +1080,15 @@ export22000() {
 #   Whole-capture (probes aren't tied to one AP); wildcard/blank probes skipped.
 probes() {
   section "🔎 probe requests: client → SSID sought"
-<<<<<<< Updated upstream
   ts -Y 'wlan.fc.type_subtype==4 && wlan.ssid != ""' -T fields -e wlan.sa -e wlan.ssid \
     | awk -F'\t' 'NF==2 && $2!=""' | dessid 2 | sort -u | tcol $'Station\tSSID sought'
-||||||| Stash base
-  ts -Y 'wlan.fc.type_subtype==4 && wlan.ssid != ""' -T fields -e wlan.sa -e wlan.ssid \
-    | awk -F'\t' 'NF==2 && $2!=""' | dessid 2 | sort -u
-=======
-  ts -Y 'wlan.fc.type_subtype==4 && wlan.ssid != ""' -T fields -e wlan.sa -e wlan.ssid |
-    awk -F'\t' 'NF==2 && $2!=""' | dessid 2 | sort -u
->>>>>>> Stashed changes
 }
 
 # handshakes: per client, which 4-way messages were captured and whether that's
 #   enough to derive keys / crack. (m1&m2) or (m2&m3) => PTK-derivable & crackable.
 handshakes() {
   section "🤝 handshake completeness (per client)"
-<<<<<<< Updated upstream
   handshake_summary | awk -F'\t' '{printf "%-18s @ %-18s  msgs:%s  crackable:%s\n",$1,$2,$3,$4}'
-||||||| Stash base
-  ts -Y "eapol && $(bssid_filter)" -T fields \
-     -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr \
-   | awk -v aps="${ALL_BSSIDS[*]}" '
-       BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
-       { if($4=="")next; sa=tolower($1); sta=(sa in AP)?$2:$1; k=sta"|"$3; M[k]=M[k] $4 }
-       END{ for(k in M){ split(k,p,"|"); s=M[k];
-              h1=index(s,"1")>0;h2=index(s,"2")>0;h3=index(s,"3")>0;h4=index(s,"4")>0;
-              crack=((h1&&h2)||(h2&&h3))?"YES":"no";
-              printf "%-18s @ %-18s  msgs:%s%s%s%s  crackable:%s\n",
-                     p[1],p[2], h1?"1":"·",h2?"2":"·",h3?"3":"·",h4?"4":"·", crack } }' | sort
-=======
-  ts -Y "eapol && $(bssid_filter)" -T fields \
-    -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr |
-    awk -v aps="${ALL_BSSIDS[*]}" '
-       BEGIN{n=split(aps,a," ");for(i=1;i<=n;i++)AP[tolower(a[i])]=1}
-       { if($4=="")next; sa=tolower($1); sta=(sa in AP)?$2:$1; k=sta"|"$3; M[k]=M[k] $4 }
-       END{ for(k in M){ split(k,p,"|"); s=M[k];
-              h1=index(s,"1")>0;h2=index(s,"2")>0;h3=index(s,"3")>0;h4=index(s,"4")>0;
-              crack=((h1&&h2)||(h2&&h3))?"YES":"no";
-              printf "%-18s @ %-18s  msgs:%s%s%s%s  crackable:%s\n",
-                     p[1],p[2], h1?"1":"·",h2?"2":"·",h3?"3":"·",h4?"4":"·", crack } }' | sort
->>>>>>> Stashed changes
 }
 
 # delkey VALUE|all: remove key(s) from the keyring by matching value (or wipe all).
@@ -1477,7 +1155,6 @@ _report_map_python() {
   fi
   section "🗺️  drawing network map for $title"
   # --- collect data into TSV files the generator reads ---
-<<<<<<< Updated upstream
   # When called from report() (MAP_PREFILL set) the beacon / WPS / client TSVs are
   # handed over from evidence report() already collected, so we skip re-scanning the
   # whole capture for them. Standalone map/mapall extract here as before.
@@ -1496,23 +1173,6 @@ _report_map_python() {
       -T fields -e wlan.bssid -e wps.manufacturer -e wps.model_name -e wps.model_number \
       -e wps.device_name -e wps.serial_number -e wps.os_version 2>/dev/null \
       | sort -u > "$wd/wps.tsv"
-||||||| Stash base
-  # beacons carry a 5th column now: the (hex-decoded) SSID, so the generator can
-  # label each physical unit with the SSIDs it radiates.
-  ts  -Y "$bfilt" -T fields -e wlan.bssid -e wlan.ds.current_channel \
-      -e wlan.ht.info.primarychannel -e radiotap.channel.freq -e wlan.ssid 2>/dev/null \
-      | dessid 5 | sort -u > "$wd/beacons.tsv"
-  ts  -Y "wps.model_name && $(bssid_filter)" -T fields -e wlan.bssid -e wps.manufacturer -e wps.model_name 2>/dev/null \
-      | sort -u > "$wd/wps.tsv"
-=======
-  # beacons carry a 5th column now: the (hex-decoded) SSID, so the generator can
-  # label each physical unit with the SSIDs it radiates.
-  ts -Y "$bfilt" -T fields -e wlan.bssid -e wlan.ds.current_channel \
-    -e wlan.ht.info.primarychannel -e radiotap.channel.freq -e wlan.ssid 2>/dev/null |
-    dessid 5 | sort -u >"$wd/beacons.tsv"
-  ts -Y "wps.model_name && $(bssid_filter)" -T fields -e wlan.bssid -e wps.manufacturer -e wps.model_name 2>/dev/null |
-    sort -u >"$wd/wps.tsv"
->>>>>>> Stashed changes
   # client<->AP association pairs, unioned across all discovery sources (assoc /
   # EAPOL / ToDS uplink / FromDS downlink) so the map shows clients that never
   # completed a captured handshake — see station_macs() for the rationale.
@@ -1530,7 +1190,6 @@ _report_map_python() {
           if(c==""||b=="") next;
           if(c in AP) next;                                 # client column is an AP
           if(tolower(substr(c,2,1)) ~ /[13579bdf]/) next;   # group-addressed
-<<<<<<< Updated upstream
           print c,b }' | sort -u > "$wd/clients.tsv"
   fi
   ts  -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u > "$wd/backhaul.tsv"
@@ -1552,48 +1211,11 @@ _report_map_python() {
   awk -F'\t' -v OFS='\t' '$14!=""{print $14,$4}'                          "$wd/_l3.raw" | sort -u > "$wd/nd.tsv"
   awk -F'\t' -v OFS='\t' 'tolower($1)~/mdns|nbns/{print $2,$15,$16}'       "$wd/_l3.raw" | sort -u > "$wd/names.tsv"
   awk -F'\t' -v OFS='\t' '{if($2!="")print $2,$1; if($4!="")print $4,$1}'  "$wd/_l3.raw" | sort -u > "$wd/proto.tsv"
-||||||| Stash base
-          print c,b }' | sort -u > "$wd/clients.tsv"
-  ts  -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u > "$wd/backhaul.tsv"
-  tsd -Y 'dhcp' -T fields -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-      -e dhcp.option.hostname -e dhcp.option.vendor_class_id 2>/dev/null | sort -u > "$wd/dhcp.tsv"
-  tsd -Y 'dhcp.option.router' -T fields -e dhcp.option.router 2>/dev/null | sort -u | grep -v '^$' | head -1 > "$wd/gw.txt"
-  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac 2>/dev/null | sort -u > "$wd/arp.tsv"
-  tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields -e icmpv6.opt.linkaddr -e ipv6.src 2>/dev/null | sort -u > "$wd/nd.tsv"
-  tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name 2>/dev/null | sort -u > "$wd/names.tsv"
-  { tsd -Y 'ip'   -T fields -e ip.src   -e _ws.col.protocol 2>/dev/null
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e _ws.col.protocol 2>/dev/null; } | sort -u > "$wd/proto.tsv"
-=======
-          print c,b }' | sort -u >"$wd/clients.tsv"
-  ts -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -e wlan.ta -e wlan.ra 2>/dev/null | sort -u >"$wd/backhaul.tsv"
-  tsd -Y 'dhcp' -T fields -e dhcp.hw.mac_addr -e dhcp.option.requested_ip_address -e dhcp.ip.your \
-    -e dhcp.option.hostname -e dhcp.option.vendor_class_id 2>/dev/null | sort -u >"$wd/dhcp.tsv"
-  tsd -Y 'dhcp.option.router' -T fields -e dhcp.option.router 2>/dev/null | sort -u | grep -v '^$' | head -1 >"$wd/gw.txt"
-  tsd -Y 'arp' -T fields -e arp.src.proto_ipv4 -e arp.src.hw_mac 2>/dev/null | sort -u >"$wd/arp.tsv"
-  tsd -Y 'icmpv6 && icmpv6.opt.linkaddr' -T fields -e icmpv6.opt.linkaddr -e ipv6.src 2>/dev/null | sort -u >"$wd/nd.tsv"
-  tsd -Y 'mdns || nbns' -T fields -e ip.src -e nbns.name -e dns.resp.name 2>/dev/null | sort -u >"$wd/names.tsv"
-  {
-    tsd -Y 'ip' -T fields -e ip.src -e _ws.col.protocol 2>/dev/null
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e _ws.col.protocol 2>/dev/null
-  } | sort -u >"$wd/proto.tsv"
->>>>>>> Stashed changes
   # observed L3 conversations (v4+v6) — drawn as dashed edges between hosts that
   # both appear on the map, i.e. real intra-LAN "who talks to whom".
-<<<<<<< Updated upstream
   awk -F'\t' -v OFS='\t' '{if($2!="")print $2,$3; if($4!="")print $4,$5}'  "$wd/_l3.raw" | sort -u > "$wd/conv.tsv"
   rm -f "$wd/_l3.raw"
   printf '%s' "$title" > "$wd/ssid.txt"
-||||||| Stash base
-  { tsd -Y 'ip'   -T fields -e ip.src   -e ip.dst   2>/dev/null
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e ipv6.dst 2>/dev/null; } | sort -u > "$wd/conv.tsv"
-  printf '%s' "$title" > "$wd/ssid.txt"
-=======
-  {
-    tsd -Y 'ip' -T fields -e ip.src -e ip.dst 2>/dev/null
-    tsd -Y 'ipv6' -T fields -e ipv6.src -e ipv6.dst 2>/dev/null
-  } | sort -u >"$wd/conv.tsv"
-  printf '%s' "$title" >"$wd/ssid.txt"
->>>>>>> Stashed changes
   # --- generate the .drawio (python; script in a var so stdin stays free) ---
   local GEN_PY
   read -r -d '' GEN_PY <<'PY'
@@ -1859,18 +1481,10 @@ xml='<mxfile><diagram name="%s"><mxGraphModel dx="1200" dy="800" grid="1" gridSi
 open(out,'w',encoding='utf-8').write(xml)
 print('units=%d backhaul_links=%d clients=%d wired=%d l3_links=%d'%(len([k for k in units if k]),len(bh_edges),len(cl_unit),sum(1 for m in wired if anyip(m)),n_l3))
 PY
-<<<<<<< Updated upstream
   local summary py_status=0
   : > "$out"                         # prevent a stale diagram masking generator failure
   summary="$("$report_python" -c "$GEN_PY" "$wd" "$out" 2>&1)" || py_status=$?
-||||||| Stash base
-  local summary; summary="$("$PYBIN" -c "$GEN_PY" "$wd" "$out" 2>&1)"
-=======
-  local summary
-  summary="$("$PYBIN" -c "$GEN_PY" "$wd" "$out" 2>&1)"
->>>>>>> Stashed changes
   rm -rf "$wd"
-<<<<<<< Updated upstream
   if [ "$py_status" -eq 0 ] && [ -s "$out" ]; then
     ok "wrote $(hlink "file://$PWD/$out" "$out") ($summary) — open at app.diagrams.net"
   else
@@ -2002,12 +1616,6 @@ map() {
   local summary=""; [ -s "$wd/summary.txt" ] && summary="$(cat "$wd/summary.txt")"
   rm -rf "$wd"
   if [ -s "$out" ]; then ok "wrote $(hlink "file://$PWD/$out" "$out") ($summary) — Bash/AWK only"
-||||||| Stash base
-  if [ -s "$out" ]; then ok "wrote $(hlink "file://$PWD/$out" "$out") ($summary) — open at app.diagrams.net"
-=======
-  if [ -s "$out" ]; then
-    ok "wrote $(hlink "file://$PWD/$out" "$out") ($summary) — open at app.diagrams.net"
->>>>>>> Stashed changes
   else note "map generation produced nothing"; fi
 }
 
@@ -2029,16 +1637,8 @@ mapall() {
   [ "${#TGT_BSSIDS[@]}" -gt 0 ] && _tgt=("${TGT_BSSIDS[@]}")
   TGT_BSSIDS=("${ALL_BSSIDS[@]}")
   MAP_ALL=1 map "$out"
-<<<<<<< Updated upstream
   SSID="$_ssid"; TGT_BSSIDS=(); [ "${#_tgt[@]}" -gt 0 ] && TGT_BSSIDS=("${_tgt[@]}")
   return 0
-||||||| Stash base
-  SSID="$_ssid"; TGT_BSSIDS=(); [ "${#_tgt[@]}" -gt 0 ] && TGT_BSSIDS=("${_tgt[@]}")
-=======
-  SSID="$_ssid"
-  TGT_BSSIDS=()
-  [ "${#_tgt[@]}" -gt 0 ] && TGT_BSSIDS=("${_tgt[@]}")
->>>>>>> Stashed changes
 }
 
 # tshark_has_field ABBREV: feature-detect fields added by newer Wireshark builds.
@@ -2328,7 +1928,6 @@ report() {
     echo 'tags: [wiboc, wifi, pcap, autopsy, wifiscope]'
     echo '---'
     echo
-<<<<<<< Updated upstream
     echo "# WiFiScope autopsy — $SSID"
     echo
     echo "> Evidence scope: packet observations from \`$PCAP\`. **Observed** means a field/frame is present; **inferred** means a role is derived from multiple observations; **not observed** is not proof of absence."
@@ -2601,33 +2200,6 @@ KEYS_TMPL
   printf '%s\n' "$station_rows" | awk -F'\t' -v OFS='\t' '$1!=""&&$2!=""{print $1,$2}' | sort -u > "$_pf/clients.tsv"
   MAP_PREFILL="$_pf" WIFISCOPE_REPORT_CONTEXT=1 _report_map_python "$mapout" >/dev/null
   rm -rf "$_pf"
-||||||| Stash base
-    echo "- pcap: \`$PCAP\`"
-    echo "- generated by wifiscope.sh"
-    for fn in recon bands crypto hardware clients handshakes keys topology hosts probes; do
-      echo; echo "## $fn"; echo '```'
-      "$fn"
-      echo '```'
-    done
-  } > "$out" 2>/dev/null
-  ok "wrote $out"
-  # also emit the matching draw.io network map next to the report
-  map "${out%.md}.drawio" >/dev/null
-=======
-    echo "- pcap: \`$PCAP\`"
-    echo "- generated by wifiscope.sh"
-    for fn in recon bands crypto hardware clients handshakes keys topology hosts probes; do
-      echo
-      echo "## $fn"
-      echo '```'
-      "$fn"
-      echo '```'
-    done
-  } >"$out" 2>/dev/null
-  ok "wrote $out"
-  # also emit the matching draw.io network map next to the report
-  map "${out%.md}.drawio" >/dev/null
->>>>>>> Stashed changes
 }
 
 # =============================================================================
@@ -2750,7 +2322,6 @@ EOF
     printf "${C_B}wifiscope›${C_RESET} "
     read -r c || break
     case "$c" in
-<<<<<<< Updated upstream
       1|recon)      recon | paint ;;
       2|bands)      bands | paint ;;
       3|crypto)     crypto | paint ;;
@@ -2778,81 +2349,6 @@ EOF
       r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; report "${f:-}" ;;
       q|quit)       break ;;
       *)            note "unknown choice: $c" ;;
-||||||| Stash base
-      1|recon)      recon | paint ;;
-      2|bands)      bands | paint ;;
-      3|crypto)     crypto | paint ;;
-      4|hardware)   hardware | paint ;;
-      5|clients)    clients | paint ;;
-      6|keys)       keys | paint ;;
-      7|topology)   topology | paint ;;
-      8|hosts)      hosts | paint ;;
-      9|probes)     probes | paint ;;
-      0|handshakes) handshakes | paint ;;
-      p|pmkid)      pmkid | paint ;;
-      x|export*)    printf 'output file [%s]: ' "${PCAP%.*}.hc22000"; read -e -r f; export22000 "${f:-}" ;;
-      h|harvest)    harvest ;;
-      g|scrapegtk)  scrapegtk ;;
-      s)            pick_ssid ;;
-      k)            set_key ;;
-      a|addkey)     addkey ;;
-      i|import)     printf 'key file to import: '; read -e -r f; import "${f:-}" ;;
-      K|keyring)    keyring ;;
-      d|delkey)     delkey ;;
-      c|clearkey)   clearkey ;;
-      m|map)        printf 'drawio file [%s.drawio]: ' "${SSID:-net}"; read -e -r f; map "${f:-}" ;;
-      M|mapall)     printf 'drawio file [network.drawio]: '; read -e -r f; mapall "${f:-}" ;;
-      r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; report "${f:-}" ;;
-      q|quit)       break ;;
-      *)            note "unknown choice: $c" ;;
-=======
-    1 | recon) recon | paint ;;
-    2 | bands) bands | paint ;;
-    3 | crypto) crypto | paint ;;
-    4 | hardware) hardware | paint ;;
-    5 | clients) clients | paint ;;
-    6 | keys) keys | paint ;;
-    7 | topology) topology | paint ;;
-    8 | hosts) hosts | paint ;;
-    9 | probes) probes | paint ;;
-    0 | handshakes) handshakes | paint ;;
-    p | pmkid) pmkid | paint ;;
-    x | export*)
-      printf 'output file [%s]: ' "${PCAP%.*}.hc22000"
-      read -e -r f
-      export22000 "${f:-}"
-      ;;
-    h | harvest) harvest ;;
-    g | scrapegtk) scrapegtk ;;
-    s) pick_ssid ;;
-    k) set_key ;;
-    a | addkey) addkey ;;
-    i | import)
-      printf 'key file to import: '
-      read -e -r f
-      import "${f:-}"
-      ;;
-    K | keyring) keyring ;;
-    d | delkey) delkey ;;
-    c | clearkey) clearkey ;;
-    m | map)
-      printf 'drawio file [%s.drawio]: ' "${SSID:-net}"
-      read -e -r f
-      map "${f:-}"
-      ;;
-    M | mapall)
-      printf 'drawio file [network.drawio]: '
-      read -e -r f
-      mapall "${f:-}"
-      ;;
-    r)
-      printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"
-      read -e -r f
-      report "${f:-}"
-      ;;
-    q | quit) break ;;
-    *) note "unknown choice: $c" ;;
->>>>>>> Stashed changes
     esac
   done
 }
@@ -2861,7 +2357,6 @@ EOF
 main() {
   # Meta commands that need neither tshark nor a pcap.
   case "${1:-}" in
-<<<<<<< Updated upstream
     -V|--version|version) printf 'wifiscope %s\n' "$VERSION"; return ;;
     -h|--help|help)       banner; printf 'usage: wifiscope.sh [command] [pcap] [ssid] [passphrase]\n'
                           printf 'commands: recon bands crypto hardware clients keys topology hosts\n'
@@ -2869,33 +2364,6 @@ main() {
                           printf '          harvest scrapegtk keymaterial keyring addkey import delkey clearkey\n'
                           printf '          selftest version   (run with no args for the interactive menu)\n'; return ;;
     selftest)             selftest; return ;;
-||||||| Stash base
-    -V|--version|version) printf 'wifiscope %s\n' "$VERSION"; return ;;
-    -h|--help|help)       banner; printf 'usage: wifiscope.sh [command] [pcap] [ssid] [passphrase]\n'
-                          printf 'commands: recon bands crypto hardware clients keys topology hosts\n'
-                          printf '          probes handshakes pmkid export22000 map mapall report\n'
-                          printf '          harvest scrapegtk keyring addkey import delkey clearkey\n'
-                          printf '          selftest version   (run with no args for the interactive menu)\n'; return ;;
-    selftest)             selftest; return ;;
-=======
-  -V | --version | version)
-    printf 'wifiscope %s\n' "$VERSION"
-    return
-    ;;
-  -h | --help | help)
-    banner
-    printf 'usage: wifiscope.sh [command] [pcap] [ssid] [passphrase]\n'
-    printf 'commands: recon bands crypto hardware clients keys topology hosts\n'
-    printf '          probes handshakes pmkid export22000 map mapall report\n'
-    printf '          harvest scrapegtk keyring addkey import delkey clearkey\n'
-    printf '          selftest version   (run with no args for the interactive menu)\n'
-    return
-    ;;
-  selftest)
-    selftest
-    return
-    ;;
->>>>>>> Stashed changes
   esac
 
   need "$TSHARK"
@@ -2934,7 +2402,6 @@ main() {
 
   # One-shot form:  wifiscope.sh <command> <pcap> [ssid] [passphrase]
   case "${1:-}" in
-<<<<<<< Updated upstream
     recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keymaterial|keyring|pmkid|probes|handshakes|export22000|map|mapall)
       local cmd="$1"; shift
       [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
@@ -2956,50 +2423,6 @@ main() {
       esac
       return
       ;;
-||||||| Stash base
-    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keyring|pmkid|probes|handshakes|export22000|map|mapall)
-      local cmd="$1"; shift
-      [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
-      load_pcap "$1"
-      SSID="${2:-}"
-      [ -n "$SSID" ] && load_target_bssids
-      if [ -n "${3:-}" ] && [ -n "$SSID" ]; then
-        PASS="$3"; kr_add wpa-pwd "$PASS:$SSID"; rebuild_dec
-      fi
-      # bands/crypto/etc need an SSID; nudge if it's missing (recon/mapall don't).
-      [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && note "no SSID given — pass one as arg 2 for scoped results"
-      # Paint the read-only display commands; run the rest (report/harvest/…) direct.
-      # mapall takes no SSID, so its arg-2 (if any) is the output .drawio filename.
-      case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes " in
-        *" $cmd "*) "$cmd" | paint ;;
-        *) if [ "$cmd" = mapall ]; then mapall "${2:-}"; else "$cmd"; fi ;;
-      esac
-      return
-      ;;
-=======
-  recon | bands | crypto | hardware | clients | keys | topology | hosts | report | harvest | scrapegtk | keyring | pmkid | probes | handshakes | export22000 | map | mapall)
-    local cmd="$1"
-    shift
-    [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
-    load_pcap "$1"
-    SSID="${2:-}"
-    [ -n "$SSID" ] && load_target_bssids
-    if [ -n "${3:-}" ] && [ -n "$SSID" ]; then
-      PASS="$3"
-      kr_add wpa-pwd "$PASS:$SSID"
-      rebuild_dec
-    fi
-    # bands/crypto/etc need an SSID; nudge if it's missing (recon/mapall don't).
-    [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && note "no SSID given — pass one as arg 2 for scoped results"
-    # Paint the read-only display commands; run the rest (report/harvest/…) direct.
-    # mapall takes no SSID, so its arg-2 (if any) is the output .drawio filename.
-    case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes " in
-    *" $cmd "*) "$cmd" | paint ;;
-    *) if [ "$cmd" = mapall ]; then mapall "${2:-}"; else "$cmd"; fi ;;
-    esac
-    return
-    ;;
->>>>>>> Stashed changes
   esac
 
   # Interactive form: optional pcap as $1, else ask.
