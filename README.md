@@ -164,6 +164,7 @@ already answered. The SSID is still verified to exist, with a probe that stops a
 | `XXD` | Path to `xxd` for hex/binary stream conversion |
 | `PYTHON3` | Python3 executable used only inside `report` |
 | `WIFISCOPE_REPORT_ROW_LIMIT=N` | Cap long event tables in a report (default `500`; summary counts still use all frames) |
+| `WIFISCOPE_JOBS=N` | Max concurrent `tshark` passes in `report`/`fingerprint`. Default is derived from cpu count, free memory, **and capture size** (~capture+256 MB budgeted per pass, spending at most 70% of free RAM). Raise it on a big host; lower it to `1`–`2` on a small VM |
 | `WIFISCOPE_REPORT_SECRETS=0` | Redact key values in the report (counts only). Keys are **included by default** — an autopsy of your own lab capture is not much use without them |
 | `WIFISCOPE_AUTHOR` | `author:` in the report frontmatter (default: `$USER`) |
 | `WIFISCOPE_OPNAME` | Operation name — becomes `<OPNAME> Mission Report` in the title (default: the SSID) |
@@ -172,10 +173,25 @@ already answered. The SSID is still verified to exist, with a probe that stops a
 TSHARK=/opt/wireshark/bin/tshark ./wifiscope.sh recon capture.pcapng
 NO_COLOR=1 ./wifiscope.sh crypto capture.pcapng HomeNet     # plain text
 WIFISCOPE_REPORT_ROW_LIMIT=1000 ./wifiscope.sh report capture.pcapng HomeNet
+WIFISCOPE_JOBS=2 ./wifiscope.sh report big.pcapng HomeNet   # memory-tight box
 WIFISCOPE_REPORT_SECRETS=0 ./wifiscope.sh report capture.pcapng HomeNet  # redact key material
 WIFISCOPE_AUTHOR='J. Doe' WIFISCOPE_OPNAME=NIGHTJAR \
   ./wifiscope.sh report capture.pcapng HomeNet hunter2   # -> "NIGHTJAR Mission Report"
 ```
+
+## Why `report` limits its own concurrency
+
+`report` and `fingerprint` fan their independent `tshark` passes out in parallel —
+but every pass dissects the **whole** capture, so each one costs real memory. Around
+29 passes over a 4 MB file is free; the same fan-out over a 255 MB capture will
+exhaust a small VM and wedge it. So the number in flight is capped, sized from cpu
+count, free memory, and the size of the capture actually loaded (roughly
+capture + 256 MB budgeted per concurrent pass, spending at most 70% of free RAM).
+Override with `WIFISCOPE_JOBS`.
+
+Concurrency never changes the output — the report is assembled from the completed
+passes afterwards, so `WIFISCOPE_JOBS=1` and `WIFISCOPE_JOBS=16` produce identical
+files, just at different speeds.
 
 ## The keyring & decryption model
 
