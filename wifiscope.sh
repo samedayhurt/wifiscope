@@ -52,6 +52,63 @@ TSHARK_FIELDS_LOADED=0
 TGT_AKMS=""         # cached AKM suite numbers advertised by the target (lazy, see target_akms)
 TGT_AKMS_LOADED=0
 
+# ---- concurrency budget -----------------------------------------------------
+# report/fingerprint fan their INDEPENDENT tshark passes out concurrently. Each of
+# those passes dissects the ENTIRE capture, so each one costs real memory - and on a
+# 255 MB capture, launching all ~27 at once was enough to exhaust a VM's RAM and wedge
+# the machine. Cap the number in flight instead of trusting the box to cope.
+# Sized by BOTH cpus and available memory, because memory is what actually runs out:
+# roughly 512 MB of headroom per concurrent tshark. WIFISCOPE_JOBS overrides.
+WS_JOBS="${WIFISCOPE_JOBS:-0}"
+case "$WS_JOBS" in ''|*[!0-9]*) WS_JOBS=0 ;; esac
+if [ "$WS_JOBS" -le 0 ]; then
+  WS_JOBS="$( { nproc; } 2>/dev/null || echo 4 )"
+  case "$WS_JOBS" in ''|*[!0-9]*) WS_JOBS=4 ;; esac
+  [ "$WS_JOBS" -gt 8 ] && WS_JOBS=8          # past this, tshark passes just thrash I/O
+  _ws_memmb="$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+  case "$_ws_memmb" in ''|*[!0-9]*) _ws_memmb=0 ;; esac
+  if [ "$_ws_memmb" -gt 0 ]; then
+    _ws_memjobs=$((_ws_memmb / 512))
+    [ "$_ws_memjobs" -lt 1 ] && _ws_memjobs=1
+    [ "$_ws_memjobs" -lt "$WS_JOBS" ] && WS_JOBS="$_ws_memjobs"
+  fi
+  unset _ws_memmb _ws_memjobs
+fi
+[ "$WS_JOBS" -lt 1 ] && WS_JOBS=1
+
+# ws_size_jobs: tighten WS_JOBS for the capture actually loaded. Capture size is the
+# variable that turned a working fan-out into a wedged machine: ~27 passes over 4 MB
+# is nothing, the same 27 over 255 MB is not. Budget roughly (capture + 256 MB) of
+# resident memory per concurrent tshark, spend at most 70% of what is available, and
+# never exceed the global WS_JOBS. An explicit WIFISCOPE_JOBS always wins.
+ws_size_jobs() {
+  [ -n "${WIFISCOPE_JOBS:-}" ] && return 0        # operator override, leave it alone
+  [ -n "$PCAP" ] && [ -f "$PCAP" ] || return 0
+  local mb per avail budget
+  mb=$(( $(stat -c %s "$PCAP" 2>/dev/null || echo 0) / 1024 / 1024 ))
+  per=$(( mb + 256 ))
+  avail="$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+  case "$avail" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$avail" -gt 0 ] || return 0
+  budget=$(( (avail * 70 / 100) / per ))
+  [ "$budget" -lt 1 ] && budget=1
+  if [ "$budget" -lt "$WS_JOBS" ]; then
+    note "capture is ${mb} MB and ${avail} MB is free — limiting to $budget concurrent tshark pass(es) (WIFISCOPE_JOBS overrides)"
+    WS_JOBS="$budget"
+  fi
+}
+
+# _jobgate: block until fewer than WS_JOBS background jobs remain, so a fan-out of
+# any size runs at a bounded width. Call it immediately before each `... &` launch.
+_jobgate() {
+  local n
+  while :; do
+    n="$(jobs -rp | grep -c .)"
+    [ "$n" -lt "$WS_JOBS" ] && return 0
+    wait -n 2>/dev/null || sleep 0.2
+  done
+}
+
 # ---- color / UX -------------------------------------------------------------
 # Color + clickable links turn ON for a real terminal (or WIFISCOPE_FORCE_COLOR=1)
 # and OFF when piped or NO_COLOR is set — so the report export and any pipes stay
@@ -1409,6 +1466,7 @@ ttl_os_hint() {
 #   each is printed beside its own result afterwards.
 fingerprint() {
   section "🔎 device fingerprinting for $SSID"
+  ws_size_jobs
   local D; D="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$D'" RETURN
@@ -1436,19 +1494,25 @@ fingerprint() {
   local -a b_args=(-Y 'http.user_agent || http.server || ssh.protocol' -T fields -E occurrence=f
     -e ip.src -e http.user_agent -e http.server -e ssh.protocol)
 
-  { tq "${a_args[@]}"; } > "$D/assoc" &
+  _jobgate
+  { tq "${a_args[@]}" | wifi_generation; } > "$D/assoc" &
+  _jobgate
   { tq "${c_args[@]}" | sort -u; } > "$D/country" &
+  _jobgate
   { tqd "${d_args[@]}" 2>/dev/null | sort -u; } > "$D/dhcp" &
+  _jobgate
   { tqd "${t_args[@]}" 2>/dev/null | sort -u; } > "$D/tls" &
+  _jobgate
   { tqd "${s_args[@]}" 2>/dev/null | sort -u; } > "$D/sd" &
-  { tqd "${l_args[@]}" 2>/dev/null; } > "$D/ttl" &
+  _jobgate
+  { tqd "${l_args[@]}" 2>/dev/null | ttl_os_hint; } > "$D/ttl" &
+  _jobgate
   { tqd "${b_args[@]}" 2>/dev/null | sort -u; } > "$D/banner" &
   wait
 
   subsection "802.11 client capability profile  (no decryption needed)"
   show_cmd 0 "${a_args[@]}"
-  wifi_generation < "$D/assoc" |
-    tcol $'Station\tVendor (OUI)\tMAC type\tGeneration\tHT (11n)\tVHT (11ac)\tHE (11ax)'
+  tcol $'Station\tVendor (OUI)\tMAC type\tGeneration\tHT (11n)\tVHT (11ac)\tHE (11ax)' < "$D/assoc"
 
   subsection "regulatory domain advertised by clients"
   show_cmd 0 "${c_args[@]}"
@@ -1475,7 +1539,7 @@ fingerprint() {
 
   subsection "OS hint from observed IP TTL"
   show_cmd 1 "${l_args[@]}"
-  ttl_os_hint < "$D/ttl" | tcol $'Source IP\tMax TTL seen\tLikely initial TTL\tLikely stack\tPackets'
+  tcol $'Source IP\tMax TTL seen\tLikely initial TTL\tLikely stack\tPackets' < "$D/ttl"
 
   subsection "service banners (HTTP / SSH)"
   show_cmd 1 "${b_args[@]}"
@@ -2259,6 +2323,7 @@ report() {
   # the assembled report is byte-identical to the sequential version — only the
   # cheap AWK/bash post-processing runs after the wait.
   local report_secrets has_gps=0 has_tk=0 D
+  ws_size_jobs
   report_secrets="${WIFISCOPE_REPORT_SECRETS:-1}"
   tshark_has_field ppi_gps.lat      && has_gps=1   # warm the -G fields cache once,
   tshark_has_field wlan.analysis.tk && has_tk=1    # so the parallel jobs don't re-run it
@@ -2274,10 +2339,13 @@ report() {
   local assoc_f="(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\""
   D="$(mktemp -d)"
 
+  _jobgate
   { tq -T fields -E occurrence=f -e frame.number -e frame.time_epoch -e frame.time -e frame.cap_len -e frame.len \
       | awk -F'\t' 'NR==1{first=$2;firstt=$3} {n++;last=$2;lastt=$3;cap+=$4;wire+=$5;if($4<$5)tr++}
           END{if(n)printf "%d\t%s\t%s\t%.3f\t%d\t%d\t%d",n,firstt,lastt,last-first,cap,wire,tr+0}'; } > "$D/frame_stats" &
+  _jobgate
   { tq -Y "wlan.fc.retry==1 && $(bssid_filter)" -T fields -e frame.number | grep -c .; } > "$D/retry" &
+  _jobgate
   { tq -Y "$(beacons_of_target)" -T fields -E aggregator='|' \
       -e frame.time -e wlan.bssid -e wlan.bssid_resolved -e wlan.ssid \
       -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \
@@ -2285,22 +2353,28 @@ report() {
       -e wlan.fixed.capabilities.privacy -e wlan.rsn.gcs.type -e wlan.rsn.pcs.type \
       -e wlan.rsn.akms.type -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr \
       -e "$oui_field" -e wlan.wfa.ie.wpa.version; } > "$D/bcn" &
+  _jobgate
   { tq -Y "$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version)" \
       -T fields -E occurrence=f -e frame.number -e wlan.bssid -e wps.manufacturer \
       -e wps.model_name -e wps.model_number -e wps.device_name -e wps.serial_number \
       -e wps.os_version | sort -u; } > "$D/wps" &
+  _jobgate
   [ "$has_gps" = 1 ] && { tq -Y "ppi_gps.lat && ppi_gps.lon && $(beacons_of_target)" -T fields -E occurrence=f \
       -e frame.time -e wlan.bssid -e ppi_gps.lat -e ppi_gps.lon -e ppi_gps.alt \
       -e ppi_gps.eph -e ppi.80211-common.dbm.antsignal | head -n "$row_limit"; } > "$D/gps" &
+  _jobgate
   { tq -Y "eapol && $(bssid_filter)" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
       -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
       -e wlan_rsna_eapol.keydes.key_info; } > "$D/eapol" &
+  _jobgate
   { tq -Y "$(bssid_filter) && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)" \
       -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.fc.type_subtype \
       -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
     | awk -F'\t' '$7!="" || ($8!="" && $8 !~ /^0*$/)' | sort -u; } > "$D/pmkid" &
+  _jobgate
   { tqd -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)" -T fields -e frame.number | grep -c .; } > "$D/deccount" &
+  _jobgate
   { tqd -Y "$(bssid_filter) && (dhcp || arp || (icmpv6 && icmpv6.opt.linkaddr) || nbns || mdns || llmnr || dns.qry.name || dns.resp.name || http.user_agent || http.server || ssh.protocol)" \
       -T fields -E occurrence=f \
       -e frame.number -e _ws.col.protocol \
@@ -2310,24 +2384,33 @@ report() {
       -e ipv6.src -e icmpv6.opt.linkaddr -e icmpv6.nd.ns.target_address -e icmpv6.nd.na.target_address \
       -e ip.src -e ip.dst -e nbns.name -e dns.resp.name -e dns.qry.name -e dns.a -e dns.aaaa \
       -e http.user_agent -e http.server -e ssh.protocol; } > "$D/l3" &
+  _jobgate
   { tq -Y "(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid; } > "$D/st_assoc" &
+  _jobgate
   { tq -Y "wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.sa -e wlan.bssid; } > "$D/st_up" &
+  _jobgate
   { tq -Y "wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)" -T fields -E occurrence=f -e wlan.da -e wlan.bssid; } > "$D/st_down" &
+  _jobgate
   { tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {0,1,2,3,11}" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
       -e wlan.bssid -e wlan.fixed.status_code -e wlan.fixed.aid; } > "$D/assoc" &
+  _jobgate
   { tq -Y "$(bssid_filter) && wlan.fc.type_subtype in {10,12}" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.fc.type_subtype -e wlan.sa -e wlan.da \
       -e wlan.bssid -e wlan.fixed.reason_code -e radiotap.dbm_antsignal; } > "$D/action" &
+  _jobgate
   { tq -Y 'wlan.fc.tods==1 && wlan.fc.fromds==1' -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.ta -e wlan.ra -e wlan.sa -e wlan.da | head -n "$row_limit"; } > "$D/wds" &
+  _jobgate
   { tq -Y 'wlan.fc.type_subtype==4 && wlan.ssid!=""' -T fields -E occurrence=f \
       -e wlan.sa -e wlan.ssid | dessid 2 | sort -u; } > "$D/probe" &
+  _jobgate
   [ "$has_tk" = 1 ] && { tqd -Y "$(bssid_filter) && (wlan.analysis.kck || wlan.analysis.kek || wlan.analysis.tk)" \
       -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.bssid -e wlan.staa \
       -e wlan_rsna_eapol.keydes.msgnr -e eapol.keydes.replay_counter \
       -e wlan.analysis.pmk -e wlan.analysis.kck -e wlan.analysis.kek -e wlan.analysis.tk \
       | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show)for(i=7;i<=10;i++)if($i!="")$i="REDACTED";print}' | sort -u; } > "$D/keyanalysis" &
+  _jobgate
   { tqd -Y "$(bssid_filter) && eapol && wlan_rsna_eapol.keydes.msgnr==3 && (wlan.rsn.ie.gtk_kde.gtk || wlan.rsn.ie.igtk.kde.igtk || wlan.rsn.ie.bigtk_kde.bigtk)" \
       -T fields -E occurrence=f -e frame.number -e frame.time -e wlan.sa -e wlan.da \
       -e wlan.bssid -e eapol.keydes.replay_counter -e wlan.rsn.ie.gtk_kde.key_id \
@@ -2335,26 +2418,48 @@ report() {
       -e wlan.rsn.ie.igtk.kde.keyid -e wlan.rsn.ie.igtk.kde.ipn -e wlan.rsn.ie.igtk.kde.igtk \
       -e wlan.rsn.ie.bigtk_kde.key_id -e wlan.rsn.ie.bigtk_kde.bipn -e wlan.rsn.ie.bigtk_kde.bigtk \
     | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show){if($9!="")$9="REDACTED";if($12!="")$12="REDACTED";if($15!="")$15="REDACTED"}print}' | sort -u; } > "$D/gtk" &
+  _jobgate
   { tq -Y "wlan.fixed.auth.alg==3 && $(bssid_filter)" -T fields -E occurrence=f \
       -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
       -e "$sae_mt" -e wlan.fixed.status_code | sort -u; } > "$D/sae" &
+  _jobgate
+  # Aggregate INSIDE the pass. These four passes used to write one line per PACKET
+  # to a temp file and, for two of them, then slurp that file into a shell variable -
+  # which on a busy 255 MB capture is hundreds of MB of text pushed through bash.
+  # Folding the summarise step into the pipeline keeps every temp file proportional to
+  # the number of DEVICES instead of the number of frames.
   { tq -Y "$assoc_f" -T fields -E aggregator=, -e wlan.sa -e wlan.sa_resolved \
-      -e wlan.ht.capabilities -e wlan.vht.capabilities "${he_f[@]}" -e radiotap.channel.freq; } > "$D/fpcap" &
+      -e wlan.ht.capabilities -e wlan.vht.capabilities "${he_f[@]}" -e radiotap.channel.freq |
+      wifi_generation; } > "$D/fpcap" &
+  _jobgate
   { tq -Y "$assoc_f && wlan.country_info.code" -T fields -E occurrence=f \
       -e wlan.sa -e wlan.country_info.code | sort -u; } > "$D/fpcountry" &
+  _jobgate
   { tqd -Y "$(bssid_filter) && dhcp" -T fields -E aggregator=, -E occurrence=a \
       -e dhcp.hw.mac_addr -e dhcp.ip.your -e dhcp.option.hostname \
       -e dhcp.option.vendor_class_id -e dhcp.option.request_list_item | sort -u; } > "$D/fpdhcp" &
+  _jobgate
   { tqd -Y "$(bssid_filter) && tls.handshake.type==1" -T fields -E occurrence=f \
       -e ip.src -e tls.handshake.extensions_server_name "${ja_f[@]}" | sort -u; } > "$D/fptls" &
+  _jobgate
   { tqd -Y "$(bssid_filter) && (dns.ptr.domain_name || dns.txt)" -T fields -E aggregator=, \
       -e ip.src -e dns.ptr.domain_name -e dns.txt | sort -u; } > "$D/fpsd" &
-  { tqd -Y "$(bssid_filter) && ip" -T fields -e ip.src -e ip.ttl; } > "$D/fpttl" &
+  _jobgate
+  { tqd -Y "$(bssid_filter) && ip" -T fields -e ip.src -e ip.ttl | ttl_os_hint; } > "$D/fpttl" &
   # Frame counts per MAC inside the target BSS — "times seen" for the selector list.
-  { tq -Y "$(bssid_filter)" -T fields -e wlan.sa -e wlan.da; } > "$D/macseen" &
+  _jobgate
+  { tq -Y "$(bssid_filter)" -T fields -e wlan.sa -e wlan.da |
+      awk -F'\t' -v OFS='\t' '{for(i=1;i<=2;i++) if($i!="") c[tolower($i)]++}
+                              END{for(m in c) print m, c[m]}'; } > "$D/macseen" &
   # Every directed probe request in the capture, with the SSID sought and a count.
-  { tq -Y 'wlan.fc.type_subtype==4' -T fields -e wlan.sa -e wlan.ssid | dessid 2; } > "$D/probe_all" &
+  _jobgate
+  { tq -Y 'wlan.fc.type_subtype==4' -T fields -e wlan.sa -e wlan.ssid | dessid 2 |
+      awk -F'\t' -v OFS='\t' '$1!="" { m=tolower($1); c[m]++
+                                 if($2!="" && !seen[m SUBSEP $2]++) s[m]=s[m] (s[m]?", ":"") $2 }
+                              END{for(m in c) print m, c[m], s[m]}'; } > "$D/probe_all" &
+  _jobgate
   { tq -q -z io,phs; } > "$D/phs_plain" &
+  _jobgate
   { tqd -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp; } > "$D/l3stats" &
   wait
 
@@ -2369,12 +2474,12 @@ report() {
   local beacon_rows security_rows wps_rows oui_rows gps_rows verdict _bcn _akms _priv _wpa1
   local sae_rows fp_cap_rows fp_country_rows fp_dhcp_rows fp_tls_rows fp_sd_rows fp_ttl_rows
   sae_rows="$(cat "$D/sae" 2>/dev/null)"
-  fp_cap_rows="$(wifi_generation < "$D/fpcap" 2>/dev/null)"
+  fp_cap_rows="$(cat "$D/fpcap" 2>/dev/null)"
   fp_country_rows="$(cat "$D/fpcountry" 2>/dev/null)"
   fp_dhcp_rows="$(cat "$D/fpdhcp" 2>/dev/null)"
   fp_tls_rows="$(cat "$D/fptls" 2>/dev/null)"
   fp_sd_rows="$(cat "$D/fpsd" 2>/dev/null)"
-  fp_ttl_rows="$(ttl_os_hint < "$D/fpttl" 2>/dev/null)"
+  fp_ttl_rows="$(cat "$D/fpttl" 2>/dev/null)"
   _bcn="$(cat "$D/bcn")"
   beacon_rows="$(printf '%s\n' "$_bcn" | dessid 4 \
     | awk -F'\t' -v OFS='\t' '
@@ -2541,7 +2646,7 @@ report() {
   assoc_selectors="$(printf '%s\n' "$station_rows" |
     awk -F'\t' '$1!=""{print tolower($1)}' | sort -u |
     awk -v caps="$(printf '%s\n' "$fp_cap_rows" | awk -F'\t' -v OFS='|' '{print tolower($1),$2,$3,$4}' | paste -sd';' -)" \
-        -v counts="$(printf '%s\n' "$macseen_rows" | awk -F'\t' '{for(i=1;i<=2;i++) if($i!="") c[tolower($i)]++} END{for(m in c) printf "%s|%s;", m, c[m]}')" '
+        -v counts="$(printf '%s\n' "$macseen_rows" | awk -F'\t' '$1!=""{printf "%s|%s;", $1, $2}')" '
       BEGIN{ n=split(caps,A,";"); for(i=1;i<=n;i++){ if(A[i]=="")continue; split(A[i],f,"|"); V[f[1]]=f[2]; T[f[1]]=f[3]; G[f[1]]=f[4] }
              n=split(counts,B,";"); for(i=1;i<=n;i++){ if(B[i]=="")continue; split(B[i],f,"|"); C[f[1]]=f[2] } }
       { m=$0
@@ -2550,13 +2655,13 @@ report() {
         g=(G[m]=="") ? "" : ", " G[m]
         printf "- **%s**: %s, %s MAC%s, seen in %d frame(s)\n", m, v, t, g, C[m]+0 }')"
 
+  # $probe_all_rows is already  mac<TAB>count<TAB>ssid-set  from the pass above.
   probe_selectors="$(printf '%s\n' "$probe_all_rows" | awk -F'\t' -v aps="${ALL_BSSIDS[*]}" '
       BEGIN{ n=split(aps,a," "); for(i=1;i<=n;i++) AP[tolower(a[i])]=1 }
-      $1!="" { m=tolower($1); if(m in AP) next
-               c[m]++; if($2!="" && !(seen[m SUBSEP $2]++)) s[m]=s[m] (s[m]?", ":"") $2 }
-      END{ for(m in c) printf "- **%s**: %s MAC, %d probe request(s)%s\n", m,
-             ((tolower(substr(m,2,1)) ~ /^[26ae]$/) ? "randomized" : "hardware"), c[m],
-             (s[m]==""?"":", sought: " s[m]) }' | sort)"
+      $1!="" && !($1 in AP) {
+        printf "- **%s**: %s MAC, %d probe request(s)%s\n", $1,
+          ((tolower(substr($1,2,1)) ~ /^[26ae]$/) ? "randomized" : "hardware"), $2,
+          ($3==""?"":", sought: " $3) }' | sort)"
 
   # Wired = a MAC that owns an IP in the decrypted L2 traffic but is neither an AP,
   # nor a wireless station of this BSS, nor the default gateway. Seeing a device's

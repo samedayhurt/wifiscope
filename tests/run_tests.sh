@@ -91,6 +91,35 @@ if [ ! -e "$TMP/nonreport-python-called" ]; then ok "map/harvest did not invoke 
 
 # Regression: every display command must survive a capture with no DHCP/no keys.
 # `hardware` used to abort with "gw_ident: unbound variable" in exactly that case.
+# Concurrency guard. report/fingerprint fan out one full-capture tshark pass per
+# evidence family; launching them all at once exhausted a VM's RAM on a 255 MB
+# capture and wedged the box. Every backgrounded pass must sit behind _jobgate, and
+# no pass may write one line per packet to a temp file. Structural, so it cannot
+# flake, and it fails the moment someone adds an ungated pass.
+echo "== every backgrounded tshark pass is concurrency-gated =="
+# Look back past comments and blank lines: a gate separated from its launch by a
+# comment block is still correct, since only executable lines run.
+_ungated="$(awk '
+  /^[[:space:]]*(#|$)/ { next }
+  /^[[:space:]]*(\{ tq|\[ "\$has_(gps|tk)" = 1 \] && \{ tq)/ {
+    if (prev !~ /^[[:space:]]*_jobgate$/) print NR": "substr($0,1,60)
+  }
+  { prev = $0 }' "$WS")"
+if [ -z "$_ungated" ]; then ok "all backgrounded tshark passes are behind _jobgate"
+else bad "ungated tshark pass(es): $(printf '%s' "$_ungated" | head -3 | tr '\n' ' ')"; fi
+grep -q '^_jobgate() {' "$WS" && ok "_jobgate helper is defined" || bad "_jobgate helper missing"
+grep -q 'WS_JOBS="${WIFISCOPE_JOBS:-0}"' "$WS" && ok "WIFISCOPE_JOBS override is honored" || bad "WIFISCOPE_JOBS override missing"
+# Assert the four passes that used to emit one row per packet now summarise inside
+# the pipeline. A launch group can span several lines (backslash continuations, a
+# trailing pipe, or a multi-line awk program in quotes), so look back from the
+# redirect rather than trying to rejoin the group into one line.
+for _p in fpcap:wifi_generation fpttl:ttl_os_hint macseen:awk probe_all:awk; do
+  _f="${_p%%:*}"; _agg="${_p##*:}"
+  if grep -B7 -F "> \"\$D/$_f\" &" "$WS" | grep -qF "$_agg"; then
+    ok "$_f aggregates in-pass (bounded by devices, not packets)"
+  else bad "$_f is not aggregated in-pass - temp file would grow with packet count"; fi
+done
+
 echo "== all display commands survive a no-decryption capture =="
 for _c in recon bands crypto hardware clients keys topology hosts probes handshakes fingerprint pmkid; do
   _out="$(NO_COLOR=1 TSHARK="$TSHARK" "$WS" "$_c" "$PCAP" MainNet 2>&1)"
