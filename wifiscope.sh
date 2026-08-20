@@ -1005,7 +1005,12 @@ crypto() {
   # advertising CCMP-128 is not running Suite-B at all.
   # Project into the column order rsn_decode_row expects (BSSID, privacy, gcs, pcs,
   # akms, mfpc, mfpr) — it decodes by POSITION, so the order is part of the contract.
-  printf '%s\n' "$rsn" | awk -F'\t' -v OFS='\t' '{print $1,$7,$2,$3,$4,$5,$6}' | grep '[^[:space:]]' |
+  # Dedupe AFTER projecting, not before: $rsn is deduped across all ten collected
+  # fields, so two beacons that differ only in a column this table does not show
+  # (the WPA1 vendor IE, RSNXE, the transition-disable bitmap) both survive and then
+  # render as the same row — the same BSSID printed twice for no visible reason.
+  printf '%s\n' "$rsn" | awk -F'\t' -v OFS='\t' '{print $1,$7,$2,$3,$4,$5,$6}' |
+    grep '[^[:space:]]' | LC_ALL=C sort -u |
     rsn_decode_row |
     tcol $'BSSID\tPrivacy\tGroup cipher\tPairwise cipher\tAKM suites\tPMF capable\tPMF required'
 
