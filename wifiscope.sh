@@ -1667,10 +1667,17 @@ pmkid() {
 _hc22000_build() {
   local out="$1"
   : > "$out" 2>/dev/null || return 1
+  local have_hcx=0
   if command -v hcxpcapngtool >/dev/null 2>&1; then
+    have_hcx=1
     hcxpcapngtool -o "$out" "$PCAP" >/dev/null 2>&1
     if [ -s "$out" ]; then printf 'hcxpcapngtool (PMKID + EAPOL)'; return 0; fi
-    rm -f "$out"; return 1
+    # hcxpcapngtool declining is NOT a reason to give up. It is strict: out-of-
+    # sequence timestamps, a deauth flood, or handshake messages it cannot pair all
+    # make it write nothing. Observed on a real merge that holds 964 perfectly good
+    # non-zero PMKIDs — it refused every one, and returning here meant the report
+    # claimed "no PMKID in the capture" while sitting on 1492 PMKID rows.
+    # So fall through and package the PMKIDs ourselves.
   fi
   command -v "$XXD" >/dev/null 2>&1 || { rm -f "$out"; return 1; }
   local ehex; ehex="$(printf '%s' "$SSID" | "$XXD" -p -c 999999 | tr -d '\r\n')"
@@ -1678,7 +1685,11 @@ _hc22000_build() {
      -e wlan.bssid -e wlan.staa -e wlan.rsn.ie.pmkid \
     | awk -F'\t' -v e="$ehex" '$3!="" && $3 !~ /^0*$/ {ap=$1;sta=$2;gsub(/:/,"",ap);gsub(/:/,"",sta);
         printf "WPA*01*%s*%s*%s*%s***\n",$3,ap,sta,e}' | LC_ALL=C sort -u > "$out"
-  if [ -s "$out" ]; then printf 'built-in PMKID only (install hcxpcapngtool for EAPOL/WPA*02)'; return 0; fi
+  if [ -s "$out" ]; then
+    if [ "$have_hcx" = 1 ]; then printf 'built-in PMKID packing (hcxpcapngtool declined this capture)'
+    else printf 'built-in PMKID only (install hcxpcapngtool to package EAPOL/WPA*02 too)'; fi
+    return 0
+  fi
   rm -f "$out"; return 1
 }
 
@@ -2819,8 +2830,13 @@ report() {
   hc_how=''; hc_lines=0; hc_body=''; hc_kinds=''
   if hc_how="$(_hc22000_build "$hcout")"; then
     hc_lines="$(grep -c . "$hcout" 2>/dev/null || echo 0)"
-    hc_kinds="$(hc22000_kind < "$hcout" | LC_ALL=C sort | uniq -c |
-                  awk '{n=$1; $1=""; sub(/^ /,""); print n" x "$0}')"
+    # Count by KIND only. Aggregating on kind+AP+STA produced a row per station and
+    # flattened the tabs into one cell, so md_table rendered a two-column table with
+    # everything crammed in column one and "—" in column two.
+    # Build the two columns by hand: blanking $1 and printing with OFS re-joins the
+    # remaining fields, which splits a label like "PMKID (client-less)" across columns.
+    hc_kinds="$(hc22000_kind < "$hcout" | cut -f1 | LC_ALL=C sort | uniq -c |
+                  awk '{ n=$1; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", $0); print n "\t" $0 }')"
     if [ "$report_secrets" = 1 ]; then hc_body="$(cat "$hcout")"; fi
   else
     hc_how=''
@@ -3031,10 +3047,10 @@ KEYS_TMPL
     printf -- '- **Keys held:** %s\n' "$([ "$keyring_count" -gt 0 ] && printf '%s (see §6)' "$keyring_count" || printf 'none')"
     if [ -n "$hc_how" ]; then
       printf -- '- **hashcat-22000 export:** `%s` — %s line(s) via %s\n' "${hcout##*/}" "$hc_lines" "$hc_how"
-      [ -n "$hc_kinds" ] && printf '%s\n' "$hc_kinds" | sed 's/^/    - /'
+      [ -n "$hc_kinds" ] && printf '%s\n' "$hc_kinds" | awk -F'\t' '{printf "    - %s x %s\n", $1, $2}'
       printf -- '- **Crack with:** `hashcat -m 22000 %s wordlist.txt`\n' "${hcout##*/}"
     else
-      printf -- '- **hashcat-22000 export:** _nothing exportable (no PMKID, and no EAPOL packer available)_\n'
+      printf -- '- **hashcat-22000 export:** _nothing exportable from this capture_\n'
     fi
     echo
     printf '%s\n' "$hs_rows" | md_table $'Station\tBSSID\tMessages 1–4\tPTK/offline-check context usable'
@@ -3248,10 +3264,11 @@ KEYS_TMPL
       echo
       echo '> [!note] `WPA*01` lines are PMKID and need no client; `WPA*02` lines come from a 4-way handshake. Both recover the **passphrase**, so they are only meaningful where the PMK is `PBKDF2(passphrase, SSID)` — i.e. WPA2-PSK, not SAE.'
     else
-      echo '_No exportable hash material: no PMKID in the capture, and no EAPOL packer available on this host._'
-      echo
-      command -v hcxpcapngtool >/dev/null 2>&1 ||
-        echo '_Install `hcxpcapngtool` to package EAPOL handshakes as `WPA*02` lines as well._'
+      if command -v hcxpcapngtool >/dev/null 2>&1; then
+        echo '_No exportable hash material: `hcxpcapngtool` declined this capture, and no non-zero PMKID could be packaged either._'
+      else
+        echo '_No exportable hash material: no non-zero PMKID in the capture, and `hcxpcapngtool` (which also packages EAPOL handshakes as `WPA*02`) is not installed._'
+      fi
     fi
 
     echo; echo '### SAE (WPA3) authentication exchange'
