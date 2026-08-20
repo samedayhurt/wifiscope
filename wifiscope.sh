@@ -9,11 +9,14 @@
 # Two ways to run it:
 #   Interactive :  ./wifiscope.sh                 # asks for a pcap, shows a menu
 #                  ./wifiscope.sh capture.pcapng  # same, pcap pre-loaded
+#                  ./wifiscope.sh capture.pcapng SSID [passphrase]
+#                        # FAST START: naming the target skips both startup prompts
+#                        # and the whole-capture SSID enumeration behind the picker.
 #   One-shot    :  ./wifiscope.sh <command> capture.pcapng [SSID] [passphrase]
 #                  e.g. ./wifiscope.sh crypto capture.pcapng Ahmed_Shebakah
 #
 # Commands (also the menu items): recon bands crypto hardware clients keys
-#                                 topology hosts report
+#                                 topology hosts fingerprint report
 #
 # Core analysis needs tshark + common shell tools. Harvesting additionally uses
 # OpenSSL 3.x and xxd. Python3 is resolved only inside report generation.
@@ -43,8 +46,11 @@ DEC=()              # tshark decryption args, REBUILT from the keyring (empty = 
 KEYRING=""          # path to <pcap>.keys — the harvested key store (UAT lines)
 TGT_BSSIDS=()       # every BSSID advertising the target SSID
 ALL_BSSIDS=()       # every BSSID in the whole capture (used to spot non-AP MACs)
+ALL_BSSIDS_LOADED=0 # ALL_BSSIDS is built on FIRST USE, not at load time (see need_all_bssids)
 TSHARK_FIELD_NAMES="" # lazily cached `tshark -G fields` abbreviations
 TSHARK_FIELDS_LOADED=0
+TGT_AKMS=""         # cached AKM suite numbers advertised by the target (lazy, see target_akms)
+TGT_AKMS_LOADED=0
 
 # ---- color / UX -------------------------------------------------------------
 # Color + clickable links turn ON for a real terminal (or WIFISCOPE_FORCE_COLOR=1)
@@ -83,7 +89,34 @@ hlink() {
 
 # ---- output helpers ---------------------------------------------------------
 # section: a bold, colored, skimmable header (emoji lives in the passed string).
-section() { printf '\n%s── %s ──%s\n' "$C_B$C_CYN" "$*" "$C_RESET"; }
+# UX_WIDTH: how wide to draw rules. A real terminal reports its size; a pipe or a
+# report has no width, so fall back to a fixed 76 and keep the output reproducible.
+UX_WIDTH="${COLUMNS:-0}"
+if [ "$UX_WIDTH" -le 0 ] 2>/dev/null; then
+  UX_WIDTH="$( { tput cols; } 2>/dev/null || echo 0 )"
+fi
+case "$UX_WIDTH" in ''|*[!0-9]*) UX_WIDTH=76 ;; esac
+[ "$UX_WIDTH" -lt 40 ] && UX_WIDTH=76
+[ "$UX_WIDTH" -gt 100 ] && UX_WIDTH=100
+
+# hr [CHAR]: a full-width rule, so sections read as blocks instead of a wall of text.
+hr() {
+  local ch="${1:-─}" i out=''
+  for ((i = 0; i < UX_WIDTH; i++)); do out+="$ch"; done
+  printf '%s%s%s\n' "$C_DIM" "$out" "$C_RESET"
+}
+# section: a top-level heading with a rule under it. The rule is what separates one
+# command's output from the next when you scroll back through a long session.
+section() {
+  printf '\n%s── %s%s\n' "$C_B$C_CYN" "$*" "$C_RESET"
+  hr
+}
+# subsection: a lighter heading for a group inside a section.
+subsection() { printf '\n%s  %s%s\n' "$C_B" "$*" "$C_RESET"; }
+# kv LABEL VALUE: an aligned "label : value" line for single facts, so a screen of
+# verdicts lines up instead of drifting with each label's length. Goes to STDOUT —
+# these are results, not status, and belong in a piped/exported capture of the run.
+kv() { printf '   %s%-14s%s %s\n' "$C_DIM" "$1" "$C_RESET" "$2"; }
 # note/ok/die: status lines to stderr, so they never pollute piped data or reports.
 note() { printf '%s  · %s%s\n' "$C_DIM$C_YEL" "$*" "$C_RESET" >&2; }
 ok() { printf '%s  ✔ %s%s\n' "$C_GRN" "$*" "$C_RESET" >&2; }
@@ -253,16 +286,59 @@ dessid() {
 load_pcap() {
   PCAP="$1"
   [ -f "$PCAP" ] || die "no such file: $PCAP"
-  note "indexing capture (one pass to list all BSSIDs)..."
-  mapfile -t ALL_BSSIDS < <(
-    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.bssid 2>/dev/null |
-      tr -d '\r' | sort -u | grep .
-  )
-  note "capture has ${#ALL_BSSIDS[@]} beaconing BSSIDs"
+  # Deliberately NO tshark pass here. Building ALL_BSSIDS costs a full read of the
+  # capture, and only clients/keys/handshakes/map/mapall/report actually need it —
+  # so it is built on first use instead (need_all_bssids). Startup is now O(1).
+  ALL_BSSIDS=()
+  ALL_BSSIDS_LOADED=0
+  TGT_AKMS=""
+  TGT_AKMS_LOADED=0
   # The keyring lives next to the pcap and persists between runs.
   KEYRING="${PCAP}.keys"
   rebuild_dec
   [ -s "$KEYRING" ] && note "loaded $(grep -c . "$KEYRING") key(s) from $KEYRING"
+}
+
+# need_all_bssids: build the every-BSSID-in-the-capture index, once, on demand.
+#   WHY lazy: it is a full pass over the file. Only the commands that must tell an
+#   AP apart from a station need it (clients, keys, handshakes, map, mapall, report);
+#   crypto/bands/hardware/hosts/topology/probes/pmkid never touch it, and used to pay
+#   for it anyway on every startup.
+#   WHY the caller must be the PARENT shell: `paint` reads ALL_BSSIDS, and both sides
+#   of `cmd | paint` run in subshells — a load performed inside either one is invisible
+#   to the other and to the cache. So menu()/main() call this BEFORE building the pipe.
+need_all_bssids() {
+  [ "$ALL_BSSIDS_LOADED" = 1 ] && return 0
+  [ -n "$PCAP" ] || return 0
+  note "indexing capture (one pass to list all BSSIDs)..."
+  mapfile -t ALL_BSSIDS < <(
+    "$TSHARK" -r "$PCAP" -Y 'wlan.fc.type_subtype==8' -T fields -e wlan.bssid 2>/dev/null |
+      tr -d '\r' | drop_group | sort -u | grep .
+  )
+  ALL_BSSIDS_LOADED=1
+  note "capture has ${#ALL_BSSIDS[@]} beaconing BSSIDs"
+}
+
+# ssid_exists NAME: true if NAME beacons anywhere in the capture — and it STOPS
+#   READING as soon as the first matching beacon is seen.
+#   HOW the early exit works: `grep -m1` closes the pipe after one line, tshark takes
+#   SIGPIPE and dies mid-file instead of decoding the remaining packets. `-l` makes
+#   tshark line-flush so that first line (and therefore the SIGPIPE) arrives at the
+#   first match rather than when a 4 KB output buffer fills. Measured on a 4 MB
+#   capture: 0.687s full pass -> 0.104s. The saving grows with capture size.
+ssid_exists() {
+  local n
+  # Stage 1: beacons — the normal case, and usually an early hit.
+  n="$("$TSHARK" -l -r "$PCAP" -Y "wlan.fc.type_subtype==8 && wlan.ssid==\"$1\"" \
+    -T fields -e wlan.bssid 2>/dev/null | tr -d '\r' | grep -m1 . )"
+  [ -n "$n" ] && return 0
+  # Stage 2: a hidden AP beacons with a zero-length SSID, so the name only ever
+  # appears in probe responses (5) and association requests (0). Without this a
+  # perfectly valid hidden target would look like a typo. Also early-exit.
+  n="$("$TSHARK" -l -r "$PCAP" \
+    -Y "(wlan.fc.type_subtype==5 || wlan.fc.type_subtype==0) && wlan.ssid==\"$1\"" \
+    -T fields -e wlan.bssid 2>/dev/null | tr -d '\r' | grep -m1 . )"
+  [ -n "$n" ]
 }
 
 # pick_ssid: list the SSIDs in the capture (with how many BSSIDs each spans) and
@@ -330,10 +406,35 @@ pick_ssid() {
 
 # load_target_bssids: cache the BSSIDs that advertise the chosen SSID.
 load_target_bssids() {
-  mapfile -t TGT_BSSIDS < <(
-    "$TSHARK" -r "$PCAP" -Y "$(beacons_of_target)" -T fields -e wlan.bssid 2>/dev/null |
-      tr -d '\r' | sort -u | grep .
-  )
+  # ONE pass, two answers. The BSSID list and the AKM suite list come from exactly
+  # the same beacons, so fetching both here makes every later "is this SAE?" test
+  # free — pmkid, export22000, set_key and handshakes all used to pay for their own
+  # full pass just to ask that question.
+  # drop_group: a BSSID is a real AP's unicast address by definition. Some captures
+  # (replayed, malformed radiotap, or certain injection tools) report a beacon's
+  # BSSID as ff:ff:ff:ff:ff:ff, and accepting that scopes every later filter to the
+  # broadcast address — which matches nothing useful while looking like a success.
+  local _raw
+  _raw="$("$TSHARK" -r "$PCAP" -Y "$(beacons_of_target)" -T fields -E aggregator=, \
+    -e wlan.bssid -e wlan.rsn.akms.type 2>/dev/null | tr -d '\r')"
+  mapfile -t TGT_BSSIDS < <(printf '%s\n' "$_raw" | cut -f1 | drop_group | sort -u | grep .)
+  TGT_AKMS="$(printf '%s\n' "$_raw" | cut -f2 | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' | sort -un)"
+  TGT_AKMS_LOADED=1
+
+  # A hidden AP's beacons carry a zero-length SSID, so the filter above matches
+  # nothing and every scoped command would silently return an empty result. The
+  # name still appears in probe responses (5), association (0) and reassociation (2)
+  # requests — scope by the BSSIDs seen there, and take the AKMs from the same
+  # frames. Costs an extra pass ONLY when stage 1 came back empty.
+  if [ "${#TGT_BSSIDS[@]}" -eq 0 ] && [ -n "$SSID" ]; then
+    _raw="$("$TSHARK" -r "$PCAP" \
+      -Y "(wlan.fc.type_subtype==5 || wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"" \
+      -T fields -E aggregator=, -e wlan.bssid -e wlan.rsn.akms.type 2>/dev/null | tr -d '\r')"
+    mapfile -t TGT_BSSIDS < <(printf '%s\n' "$_raw" | cut -f1 | drop_group | sort -u | grep .)
+    TGT_AKMS="$(printf '%s\n' "$_raw" | cut -f2 | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' | sort -un)"
+    [ "${#TGT_BSSIDS[@]}" -gt 0 ] &&
+      note "no usable beacon BSSID for \"$SSID\" (hidden AP, or beacons carry a group address) — scoped by ${#TGT_BSSIDS[@]} BSSID(s) from probe/assoc frames"
+  fi
 }
 
 # set_key: ask for the WPA passphrase, store it in the keyring, and rebuild DEC.
@@ -350,6 +451,7 @@ set_key() {
     kr_add wpa-pwd "$PASS:$SSID"
     rebuild_dec
     note "decryption enabled (wpa-pwd added to keyring)"
+    sae_passphrase_warning
   else
     note "no passphrase entered"
   fi
@@ -571,11 +673,32 @@ harvest() {
 keyring() {
   section "🗝️  keyring: $(hlink "file://$KEYRING" "${KEYRING:-<none>}")"
   if [ -n "$KEYRING" ] && [ -s "$KEYRING" ]; then
-    awk -F'\t' -v c="$C_MAG" -v r="$C_RESET" '{printf "  %s%-8s%s %s\n", c,$1,r,$2}' "$KEYRING"
+    local _t _v
+    while IFS=$'\t' read -r _t _v; do
+      [ -n "$_t" ] || continue
+      printf '  %s%-8s%s %s\n' "$C_MAG" "$_t" "$C_RESET" "$_v"
+      printf '           %s%s%s\n' "$C_DIM" "$(key_type_label "$_t")" "$C_RESET"
+    done < "$KEYRING"
     printf '%stotal keys:%s %s\n' "$C_B" "$C_RESET" "$(grep -c . "$KEYRING")"
   else
     echo "  (empty — set a passphrase 'k' or run harvest 'h')"
   fi
+}
+
+# key_type_label TYPE: what a keyring type actually IS, in words. A column of
+#   "wpa-pwd / wpa-psk / tk" tells a reader nothing about which secret they are
+#   holding or what it decrypts; these labels are the difference between a key
+#   inventory and a list of strings.
+key_type_label() {
+  case "${1%%$'\r'}" in
+    wpa-pwd) printf 'WPA passphrase + SSID (tshark derives the PMK via PBKDF2 — WPA2-PSK only)' ;;
+    wpa-psk) printf 'PMK / PSK, 256-bit — the pairwise master key for this SSID' ;;
+    tk)      printf 'PTK-TK, the per-session pairwise temporal key (decrypts one client)' ;;
+    gtk)     printf 'GTK, the group temporal key (decrypts broadcast/multicast)' ;;
+    wep)     printf 'WEP key (legacy, 40/104/128-bit)' ;;
+    msk)     printf 'MSK from 802.1X/EAP (Enterprise)' ;;
+    *)       printf 'unrecognized key type' ;;
+  esac
 }
 
 # is_hex STR: true if STR is only hex digits (used to sanity-check key material).
@@ -722,6 +845,7 @@ bands() {
 #          1  802.1X (EAP)            2  PSK               3  FT-802.1X
 #          4  FT-PSK                  5  802.1X-SHA256     6  PSK-SHA256
 #          8  SAE                     9  FT-SAE           11  802.1X Suite-B
+#         24  SAE-GDH                25  FT-SAE-GDH        (WPA3 R3 group-dependent hash)
 #         12  802.1X Suite-B-384     13  FT-802.1X-SHA384 14-17 FILS
 #         18  OWE                    19  FT-PSK-SHA384    20  PSK-SHA384
 #        When no RSN AKM is present we fall back to the WPA1 vendor IE, then the
@@ -731,10 +855,52 @@ bands() {
 #   line on stdin) plus two flags, privacy-bit-seen ($1) and wpa1-IE-seen ($2), and
 #   prints "class<TAB>verdict". class ∈ strong|trans|ent|weak|open picks the colour.
 #   No tshark, no globals — so the classification is unit-testable on its own.
+# ---- WPA3 / RSN number -> name decoding -------------------------------------
+# tshark reports AKM and cipher suites as bare selector numbers. Printing "8" or
+# "9" tells you nothing; "SAE" and "GCMP-256" tell you the whole story. Both
+# decoders are stdin filters (one number per line) so selftest can exercise them
+# with no pcap. Unknown numbers pass through labelled rather than silently blank.
+# Tables: IEEE 802.11-2020 Table 9-151 (AKM) and Table 9-149 (cipher suites),
+# plus AKM 24/25 (SAE group-dependent hash) from the WPA3 R3 / 802.11-2024 update.
+akm_names() {
+  awk -v tbl="1:802.1X-EAP 2:PSK 3:FT-802.1X 4:FT-PSK 5:802.1X-SHA256 6:PSK-SHA256 7:TDLS-TPK 8:SAE 9:FT-SAE 10:APPeerKey 11:802.1X-SuiteB-SHA256 12:802.1X-SuiteB-192-SHA384 13:FT-802.1X-SHA384 14:FILS-SHA256 15:FILS-SHA384 16:FT-FILS-SHA256 17:FT-FILS-SHA384 18:OWE 19:FT-PSK-SHA384 20:PSK-SHA384 24:SAE-GDH 25:FT-SAE-GDH" '
+    BEGIN{ n=split(tbl,a," "); for(i=1;i<=n;i++){ split(a[i],kv,":"); N[kv[1]+0]=kv[2] } }
+    { gsub(/[^0-9]/,""); if($0=="") next; t=$0+0; print (t in N) ? N[t] : ("AKM-" t) }'
+}
+
+cipher_names() {
+  awk -v tbl="0:use-group 1:WEP-40 2:TKIP 4:CCMP-128 5:WEP-104 6:BIP-CMAC-128 7:no-group-traffic 8:GCMP-128 9:GCMP-256 10:CCMP-256 11:BIP-GMAC-128 12:BIP-GMAC-256 13:BIP-CMAC-256" '
+    BEGIN{ n=split(tbl,a," "); for(i=1;i<=n;i++){ split(a[i],kv,":"); N[kv[1]+0]=kv[2] } }
+    { gsub(/[^0-9]/,""); if($0=="") next; t=$0+0; print (t in N) ? N[t] : ("cipher-" t) }'
+}
+
+# rsn_decode_row: rewrite a  BSSID / privacy / gcs / pcs / akms / mfpc / mfpr  TSV
+#   in place so the cipher and AKM columns read as names. Comma-separated lists are
+#   preserved element-for-element, and PMF becomes yes/no instead of 1/0 — a report
+#   table full of bare selector numbers is evidence nobody can check.
+rsn_decode_row() {
+  awk -F'\t' -v OFS='\t' -v atbl="1:802.1X-EAP 2:PSK 3:FT-802.1X 4:FT-PSK 5:802.1X-SHA256 6:PSK-SHA256 7:TDLS-TPK 8:SAE 9:FT-SAE 10:APPeerKey 11:802.1X-SuiteB-SHA256 12:802.1X-SuiteB-192-SHA384 13:FT-802.1X-SHA384 14:FILS-SHA256 15:FILS-SHA384 16:FT-FILS-SHA256 17:FT-FILS-SHA384 18:OWE 19:FT-PSK-SHA384 20:PSK-SHA384 24:SAE-GDH 25:FT-SAE-GDH" -v ctbl="0:use-group 1:WEP-40 2:TKIP 4:CCMP-128 5:WEP-104 6:BIP-CMAC-128 7:no-group-traffic 8:GCMP-128 9:GCMP-256 10:CCMP-256 11:BIP-GMAC-128 12:BIP-GMAC-256 13:BIP-CMAC-256" '
+    BEGIN{ n=split(atbl,x," "); for(i=1;i<=n;i++){ split(x[i],kv,":"); A[kv[1]+0]=kv[2] }
+           n=split(ctbl,y," "); for(i=1;i<=n;i++){ split(y[i],kv,":"); C[kv[1]+0]=kv[2] } }
+    function dec(v,T,pfx,   m,parts,i,o,t) {
+      if (v=="") return ""
+      m=split(v,parts,",")
+      for(i=1;i<=m;i++){ t=parts[i]; gsub(/[^0-9]/,"",t); if(t=="") continue
+        o = o (o?",":"") (((t+0) in T) ? T[t+0] : pfx t) }
+      return o }
+    # tshark renders a boolean field as "True"/"False", NOT as 1/0, so a test for
+    # "1" alone reported every PMF-required BSS as "no" — the exact opposite of the
+    # truth, and disagreeing with the verdict line printed underneath it.
+    function yn(v) { if (v=="") return ""
+                     return (v ~ /(^|,)[[:space:]]*([1]|[Tt][Rr][Uu][Ee])[[:space:]]*($|,)/) ? "yes" : "no" }
+    { $3=dec($3,C,"cipher-"); $4=dec($4,C,"cipher-"); $5=dec($5,A,"AKM-")
+      $6=yn($6); $7=yn($7); print }'
+}
+
 classify_akm() {
   awk -v priv="${1:-}" -v wpa1="${2:-}" '
     { t=$1+0
-      if      (t==8||t==9)                          sae=1
+      if      (t==8||t==9||t==24||t==25)            sae=1   # 24/25 = SAE group-dependent hash (WPA3 R3)
       else if (t==2||t==4||t==6||t==19||t==20)      psk=1
       else if (t==1||t==3||t==5)                    eap=1
       else if (t==11||t==12||t==13)               { eap=1; sb=1 }   # Suite-B/SHA384
@@ -755,20 +921,102 @@ classify_akm() {
     }'
 }
 
+# target_akms: the set of AKM suite numbers the target advertises, one per line,
+#   cached for the session (one pass, reused by crypto/pmkid/set_key/export22000).
+target_akms() {
+  # Normally already filled in by load_target_bssids from the same beacons, so this
+  # is a cache read. The pass below is only a safety net for a caller that set SSID
+  # without going through load_target_bssids.
+  if [ "$TGT_AKMS_LOADED" != 1 ]; then
+    TGT_AKMS="$(tq -Y "$(beacons_of_target)" -T fields -e wlan.rsn.akms.type |
+      tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' | sort -un)"
+    TGT_AKMS_LOADED=1
+  fi
+  printf '%s\n' "$TGT_AKMS"
+}
+
+# target_is_sae / target_has_psk: which key-establishment the target actually offers.
+target_is_sae()  { target_akms | grep -qxE '8|9|24|25'; }
+target_has_psk() { target_akms | grep -qxE '2|6|19|20'; }
+
+# sae_passphrase_warning: the single most expensive misunderstanding in WPA3 triage.
+#   tshark's `wpa-pwd` key turns a passphrase into a PMK with PBKDF2(passphrase,SSID)
+#   — that is the WPA2-PSK derivation and ONLY that. Under WPA3-SAE the PMK is an
+#   output of the SAE elliptic-curve exchange; it is not a function of the passphrase
+#   alone and no amount of correct password gets you the PMK. So on an SAE-only BSS
+#   the tool would happily say "decryption enabled" and then decrypt nothing, which
+#   reads as a broken capture rather than a protocol boundary. Say so out loud.
+sae_passphrase_warning() {
+  [ -n "$SSID" ] || return 0
+  target_is_sae || return 0
+  if target_has_psk; then
+    note "WPA2/WPA3 transition BSS: this passphrase only decrypts clients that joined with WPA2-PSK."
+    note "SAE clients need harvested key material instead — 'h' harvest, or 'a' addkey with a PTK-TK/GTK."
+  else
+    note "⚠ $SSID is WPA3-SAE only: a passphrase CANNOT decrypt it."
+    note "  wpa-pwd means PBKDF2(passphrase,SSID) = the WPA2 PMK. SAE derives its PMK from the"
+    note "  elliptic-curve exchange, so the password alone is not enough — even when it is correct."
+    note "  Use 'h' harvest / 'g' scrapegtk / 'a' addkey to load a PTK-TK or GTK directly."
+  fi
+}
+
+# sae_summary: the WPA3 SAE authentication exchange — invisible to EAPOL msgnr.
+#   SAE runs inside 802.11 Authentication frames (algorithm 3) BEFORE the 4-way:
+#     message type 1 = Commit, 2 = Confirm; one of each in BOTH directions = complete.
+#   Status codes worth seeing: 0 success, 76 anti-clogging token required (the AP is
+#   rate-limiting / under load), 77 unsupported finite cyclic group (client and AP
+#   disagree on the ECC group — a real-world WPA3 interop failure).
+sae_summary() {
+  local mt="wlan.fixed.sae_message_type"
+  tshark_has_field "$mt" || mt="wlan.fixed.auth_seq"
+  ts -Y "wlan.fixed.auth.alg==3 && $(bssid_filter)" -T fields \
+    -e wlan.sa -e wlan.da -e wlan.bssid -e "$mt" -e wlan.fixed.status_code |
+    awk -F'\t' -v OFS='\t' '
+      $1!="" {
+        k=$1 SUBSEP $2 SUBSEP $3
+        if(!(k in seen)){ seen[k]=1; ord[++m]=k }
+        if($4==1) commit[k]++; else if($4==2) confirm[k]++
+        if($5!="" && $5!="0") st[k]=st[k] (st[k]?",":"") $5
+      }
+      END{ for(i=1;i<=m;i++){ k=ord[i]; split(k,q,SUBSEP)
+             print q[1],q[2],q[3],commit[k]+0,confirm[k]+0,(st[k]==""?"0 (success)":st[k]) } }' |
+    sort
+}
+
 crypto() {
   section "🔐 encryption for $SSID"
-  ts -Y "$(beacons_of_target)" -T fields \
-    -e wlan.bssid -e wlan.rsn.akms.type \
-    -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr | sort -u
-  # Collapse all AKM suite numbers seen across the target's beacons into one verdict.
-  local akms
-  akms="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.rsn.akms.type 2>/dev/null |
-    tr ',' '\n' | tr -d ' ' | sort -u | grep .)"
-  # Privacy bit (open vs WEP when no RSN) and WPA1 vendor IE (legacy, but not open).
-  local priv wpa1
-  priv="$(ts -Y "$(beacons_of_target)" -T fields -e wlan.fixed.capabilities.privacy 2>/dev/null |
-    tr -d ' ' | sort -u | grep -m1 1)"
-  wpa1="$(ts -Y "$(beacons_of_target) && wlan.wfa.ie.wpa.version" -T fields -e wlan.bssid 2>/dev/null | grep -m1 .)"
+  # ONE pass answers every question below. This used to issue a separate full read
+  # of the capture per question (AKMs, ciphers, privacy bit, WPA1 vendor IE, mfpc,
+  # mfpr, H2E, transition-disable) — eight scans of the same beacons. Optional
+  # fields are appended only when this tshark knows them: naming a field tshark
+  # does not have makes it reject the ENTIRE -e list and print nothing at all.
+  local -a xf=()
+  local has_h2e=0 has_td=0
+  tshark_has_field wlan.rsnx.sae_hash_to_element && { xf+=(-e wlan.rsnx.sae_hash_to_element); has_h2e=1; }
+  tshark_has_field wlan.transition_disable_bitmap && { xf+=(-e wlan.transition_disable_bitmap); has_td=1; }
+  local rsn
+  rsn="$(ts -Y "$(beacons_of_target)" -T fields -E aggregator=, \
+    -e wlan.bssid -e wlan.rsn.gcs.type -e wlan.rsn.pcs.type -e wlan.rsn.akms.type \
+    -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr \
+    -e wlan.fixed.capabilities.privacy -e wlan.wfa.ie.wpa.version "${xf[@]}" | sort -u)"
+
+  # Per-BSSID RSN detail, with the selector numbers spelled out. Group/pairwise
+  # ciphers matter for WPA3: Enterprise-192 mandates GCMP-256, so a "WPA3" AP
+  # advertising CCMP-128 is not running Suite-B at all.
+  # Project into the column order rsn_decode_row expects (BSSID, privacy, gcs, pcs,
+  # akms, mfpc, mfpr) — it decodes by POSITION, so the order is part of the contract.
+  printf '%s\n' "$rsn" | awk -F'\t' -v OFS='\t' '{print $1,$7,$2,$3,$4,$5,$6}' | grep '[^[:space:]]' |
+    rsn_decode_row |
+    tcol $'BSSID\tPrivacy\tGroup cipher\tPairwise cipher\tAKM suites\tPMF capable\tPMF required'
+
+  # Derive every verdict input from the single pass above — no more tshark here.
+  local akms priv wpa1
+  akms="$(printf '%s\n' "$rsn" | cut -f4 | tr ',' '\n' | tr -d ' ' | grep -E '^[0-9]+$' | sort -un)"
+  priv="$(printf '%s\n' "$rsn" | cut -f7 | tr ',' '\n' | tr -d ' ' | grep -m1 -ixE '1|true')"
+  wpa1="$(printf '%s\n' "$rsn" | cut -f8 | tr -d ' ' | grep -m1 .)"
+  # Seed the session-wide AKM cache so pmkid/export22000/set_key need no pass at all.
+  TGT_AKMS="$akms"; TGT_AKMS_LOADED=1
+
   local cls txt
   IFS=$'\t' read -r cls txt < <(printf '%s\n' "$akms" | classify_akm "$priv" "$wpa1")
   local col
@@ -776,7 +1024,43 @@ crypto() {
   strong) col="$C_GRN" ;; trans) col="$C_YEL" ;; ent) col="$C_MAG" ;;
   weak | open) col="$C_RED" ;; *) col="$C_B" ;;
   esac
-  printf '%s🔒 verdict:%s %s%s%s\n' "$C_B" "$C_RESET" "$col" "$txt" "$C_RESET"
+  printf '\n%s🔒 verdict:%s %s%s%s\n' "$C_B" "$C_RESET" "$col$C_B" "$txt" "$C_RESET"
+
+  local akm_txt cipher_txt
+  akm_txt="$(printf '%s\n' "$akms" | akm_names | paste -sd, - | sed 's/,/, /g')"
+  cipher_txt="$(printf '%s\n' "$rsn" | cut -f2,3 | tr '\t,' '\n\n' | tr -d ' ' |
+    grep -E '^[0-9]+$' | sort -un | cipher_names | paste -sd, - | sed 's/,/, /g')"
+  kv "AKM suites" "${akm_txt:-—}"
+  kv "ciphers"    "${cipher_txt:-—}"
+
+  # PMF / 802.11w. WPA3-Personal REQUIRES management frame protection; a BSS that
+  # claims SAE but leaves mfpr clear is still deauth-attackable, which is exactly
+  # the misconfiguration this tool exists to surface.
+  local mfpc mfpr pmf
+  mfpc="$(printf '%s\n' "$rsn" | cut -f5 | tr ',' '\n' | tr -d ' ' | grep -m1 -ixE '1|true')"
+  mfpr="$(printf '%s\n' "$rsn" | cut -f6 | tr ',' '\n' | tr -d ' ' | grep -m1 -ixE '1|true')"
+  if [ -n "$mfpr" ];   then pmf="${C_GRN}required${C_RESET}"
+  elif [ -n "$mfpc" ]; then pmf="${C_YEL}capable, not required${C_RESET}"
+  else                      pmf="${C_RED}absent — deauth/disassoc spoofing works${C_RESET}"; fi
+  kv "PMF (11w)" "$pmf"
+
+  # WPA3 R3 extras: hash-to-element (closes the SAE dictionary side-channel in the
+  # original hunting-and-pecking loop), and the transition-disable bitmap (the AP
+  # telling clients to stop accepting the WPA2 fallback).
+  if [ "$has_h2e" = 1 ]; then
+    local c=9
+    printf '%s\n' "$rsn" | cut -f$c | grep -qiE '^(1|true)' && kv "SAE H2E" "advertised (hash-to-element)"
+  fi
+  if [ "$has_td" = 1 ]; then
+    local c=$((9 + has_h2e))
+    printf '%s\n' "$rsn" | cut -f$c | grep -q '[^[:space:]]' &&
+      kv "transition" "disable bitmap present (WPA2 fallback being withdrawn)"
+  fi
+
+  if target_is_sae && [ -z "$mfpr" ]; then
+    note "SAE advertised but PMF is not required — that combination is out of spec for WPA3-Personal."
+  fi
+  sae_passphrase_warning
 }
 
 # hardware: identify the router — make / model / model# / device / serial /
@@ -801,7 +1085,10 @@ hardware() {
   # The router's OWN LAN IP (DHCP default-gateway option) and the banners it serves.
   # A TP-Link/whatever whose beacon WPS IE carries only version/state still reveals
   # its model+firmware in its UPnP/HTTP server string (e.g. "UPnP/1.0 TL-WR841N/9.0").
-  local gw gw_ident
+  # gw_ident MUST be initialised: it is only assigned when a DHCP router option was
+  # seen, and `set -u` aborts on the `[ -n "$gw_ident" ]` test below otherwise — so
+  # `hardware` died outright on every capture without DHCP evidence.
+  local gw gw_ident=''
   gw="$(tsd -Y "$(bssid_filter) && dhcp.option.router" -T fields -E occurrence=f -e dhcp.option.router 2>/dev/null \
        | tr ',' '\n' | grep -m1 -E '^[0-9]+\.[0-9]')"
   [ -n "$gw" ] && gw_ident="$(tsd -Y "ip.src==$gw && http.server" -T fields -E occurrence=f -e http.server 2>/dev/null \
@@ -1040,11 +1327,170 @@ hosts() {
       | tcol $'Source IP\tHTTP User-Agent\tHTTP Server\tSSH protocol'
 }
 
+# show_cmd DECRYPT ARGS...: print the teaching line for a tshark pass WITHOUT
+#   running it. Lets fingerprint() launch its independent passes concurrently and
+#   still show each command next to its own result, in a deterministic order.
+show_cmd() {
+  local d="$1"; shift
+  printf '%s' "$C_DIM$C_GRN" >&2
+  print_tshark_command "$d" 0 "$@" >&2
+  printf '%s' "$C_RESET" >&2
+}
+
+# wifi_generation: map the capability elements in an association request to the
+#   marketing generation, because "does this client do HE?" is the question people
+#   actually ask. HE (802.11ax) => Wi-Fi 6 (6E when it associated on 6 GHz), VHT
+#   (11ac) => Wi-Fi 5, HT (11n) => Wi-Fi 4, none => legacy 11a/b/g. Wireshark 4.2
+#   exposes no EHT capability field, so Wi-Fi 7 is not distinguishable here and we
+#   deliberately do not guess it.
+#   Input TSV: sa, sa_resolved, ht, vht, he, freq
+wifi_generation() {
+  awk -F'\t' -v OFS='\t' '
+    $1!="" {
+      sa=$1; if(!(sa in seen)){seen[sa]=1; ord[++n]=sa}
+      if($2!="") vendor[sa]=$2
+      if($3!="") ht[sa]=1
+      if($4!="") vht[sa]=1
+      if($5!="") he[sa]=1
+      if($6!="") f[sa]=$6+0
+    }
+    END{
+      for(i=1;i<=n;i++){ sa=ord[i]; g="legacy 11a/b/g"
+        if(sa in he)       g = (f[sa]>=5925) ? "Wi-Fi 6E (11ax, 6 GHz)" : "Wi-Fi 6 (11ax)"
+        else if(sa in vht) g = "Wi-Fi 5 (11ac)"
+        else if(sa in ht)  g = "Wi-Fi 4 (11n)"
+        v = vendor[sa]
+        if (v=="" || tolower(v)==tolower(sa)) v="—"    # sa_resolved echoes the MAC when unknown
+        # U/L bit (bit 1 of the first octet) set = locally administered = a randomized
+        # privacy MAC, not burned-in hardware. For unicast that is second hex digit
+        # 2/6/a/e. This is why the vendor column is empty for most modern phones —
+        # and knowing WHICH stations randomize is itself the finding, since a
+        # randomized MAC cannot be tracked across sessions but a real OUI can.
+        print sa, v, (tolower(substr(sa,2,1)) ~ /^[26ae]$/ ? "randomized" : "hardware"), g,
+              ((sa in ht)?"yes":"—"), ((sa in vht)?"yes":"—"), ((sa in he)?"yes":"—")
+      }
+    }'
+}
+
+# ttl_os_hint: initial-TTL is a coarse but genuinely useful OS discriminator, and
+#   it costs nothing once the traffic is decrypted. Stacks ship distinct defaults:
+#   64 (Linux/Android/macOS/iOS/*BSD), 128 (Windows), 255 (network gear/printers).
+#   We report the OBSERVED ttl and the nearest default above it, and label it a hint
+#   — a router in the path decrements it, so this is evidence, not proof.
+ttl_os_hint() {
+  awk -F'\t' -v OFS='\t' '
+    $1!="" && $2!="" {
+      k=$1; t=$2+0
+      if(!(k in seen)){seen[k]=1; ord[++n]=k}
+      if(!(k in lo) || t>hi[k]) hi[k]=t
+      cnt[k]++
+    }
+    END{
+      for(i=1;i<=n;i++){ k=ord[i]; t=hi[k]
+        if(t<=64)       {init=64;  os="Linux / Android / macOS / iOS / BSD"}
+        else if(t<=128) {init=128; os="Windows"}
+        else            {init=255; os="network device / printer / embedded"}
+        print k, t, init, os, cnt[k]
+      }
+    }'
+}
+
+# fingerprint: identify the DEVICES, not just the addresses. Two halves:
+#   (1) works with no keys at all — the 802.11 capability profile a client leaks in
+#       its association request (vendor OUI, Wi-Fi generation, country code);
+#   (2) needs decryption — DHCP option-55 signature, TLS SNI + JA3/JA4, DNS-SD
+#       service and model strings, TTL, and service banners.
+#   Every pass here is independent, so they run concurrently and the command for
+#   each is printed beside its own result afterwards.
+fingerprint() {
+  section "🔎 device fingerprinting for $SSID"
+  local D; D="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$D'" RETURN
+
+  local assoc_filter="(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\""
+  local -a a_args=(-Y "$assoc_filter" -T fields -E aggregator=,
+    -e wlan.sa -e wlan.sa_resolved -e wlan.ht.capabilities -e wlan.vht.capabilities
+    -e wlan.ext_tag.he_mac_caps -e radiotap.channel.freq)
+  local -a c_args=(-Y "$assoc_filter && wlan.country_info.code" -T fields -E occurrence=f
+    -e wlan.sa -e wlan.country_info.code)
+  local -a d_args=(-Y 'dhcp' -T fields -E aggregator=, -E occurrence=a
+    -e dhcp.hw.mac_addr -e dhcp.ip.your -e dhcp.option.hostname
+    -e dhcp.option.vendor_class_id -e dhcp.option.request_list_item)
+  # JA3/JA4 are not in every Wireshark build. Naming a field this tshark does not
+  # have makes it reject the whole -e list and emit NOTHING, so the section would
+  # look empty rather than degraded. Build the field list and its header together.
+  local tls_hdr=$'Source IP\tSNI (server name)'
+  local -a t_args=(-Y 'tls.handshake.type==1' -T fields -E occurrence=f
+    -e ip.src -e tls.handshake.extensions_server_name)
+  if tshark_has_field tls.handshake.ja3; then t_args+=(-e tls.handshake.ja3); tls_hdr+=$'\tJA3'; fi
+  if tshark_has_field tls.handshake.ja4; then t_args+=(-e tls.handshake.ja4); tls_hdr+=$'\tJA4'; fi
+  local -a s_args=(-Y 'dns.ptr.domain_name || dns.txt' -T fields -E aggregator=,
+    -e ip.src -e dns.ptr.domain_name -e dns.txt)
+  local -a l_args=(-Y 'ip' -T fields -e ip.src -e ip.ttl)
+  local -a b_args=(-Y 'http.user_agent || http.server || ssh.protocol' -T fields -E occurrence=f
+    -e ip.src -e http.user_agent -e http.server -e ssh.protocol)
+
+  { tq "${a_args[@]}"; } > "$D/assoc" &
+  { tq "${c_args[@]}" | sort -u; } > "$D/country" &
+  { tqd "${d_args[@]}" 2>/dev/null | sort -u; } > "$D/dhcp" &
+  { tqd "${t_args[@]}" 2>/dev/null | sort -u; } > "$D/tls" &
+  { tqd "${s_args[@]}" 2>/dev/null | sort -u; } > "$D/sd" &
+  { tqd "${l_args[@]}" 2>/dev/null; } > "$D/ttl" &
+  { tqd "${b_args[@]}" 2>/dev/null | sort -u; } > "$D/banner" &
+  wait
+
+  subsection "802.11 client capability profile  (no decryption needed)"
+  show_cmd 0 "${a_args[@]}"
+  wifi_generation < "$D/assoc" |
+    tcol $'Station\tVendor (OUI)\tMAC type\tGeneration\tHT (11n)\tVHT (11ac)\tHE (11ax)'
+
+  subsection "regulatory domain advertised by clients"
+  show_cmd 0 "${c_args[@]}"
+  tcol $'Station\tCountry code' < "$D/country"
+
+  # Option 55 is the ordered list of options a client asks for. That order is a
+  # stable per-OS signature (the classic fingerbank/p0f DHCP fingerprint), so it
+  # separates Android from iOS from Windows even when the hostname is generic.
+  subsection "DHCP identity + option-55 parameter-request signature"
+  show_cmd 1 "${d_args[@]}"
+  tcol $'Client MAC\tAssigned IP\tHostname\tVendor class (60)\tParameter request list (55)' < "$D/dhcp"
+
+  # SNI says which service the device phones home to; JA3/JA4 hash the TLS
+  # ClientHello, which is a per-stack signature that survives an encrypted payload.
+  subsection "TLS ClientHello identity (SNI + JA3/JA4)"
+  show_cmd 1 "${t_args[@]}"
+  tcol "$tls_hdr" < "$D/tls"
+
+  # DNS-SD advertises what a device IS: _airplay._tcp, _googlecast._tcp,
+  # _printer._tcp, and TXT records that usually carry an explicit model= string.
+  subsection "DNS-SD / mDNS advertised services and model strings"
+  show_cmd 1 "${s_args[@]}"
+  tcol $'Source IP\tService (PTR)\tTXT record' < "$D/sd"
+
+  subsection "OS hint from observed IP TTL"
+  show_cmd 1 "${l_args[@]}"
+  ttl_os_hint < "$D/ttl" | tcol $'Source IP\tMax TTL seen\tLikely initial TTL\tLikely stack\tPackets'
+
+  subsection "service banners (HTTP / SSH)"
+  show_cmd 1 "${b_args[@]}"
+  tcol $'Source IP\tHTTP User-Agent\tHTTP Server\tSSH protocol' < "$D/banner"
+}
+
 # pmkid: list RSN PMKID evidence.  PMKIDs are commonly carried in association RSN
 #   information, so requiring EAPOL here silently misses valid client-less data.
 #   Zero-valued PMKIDs are filtered out.
 pmkid() {
   section "🪪 PMKIDs (offline-crackable, client-less)"
+  # The client-less PMKID attack recovers a WPA2 passphrase because the PMKID is
+  # HMAC over a PMK that IS PBKDF2(passphrase,SSID). Under SAE the PMK comes from
+  # the ECC exchange, so an SAE PMKID is not a password oracle — it is just an
+  # identifier. Flag it, or the hashcat run below is wasted effort.
+  if target_is_sae && ! target_has_psk; then
+    note "target is WPA3-SAE only: any PMKID below is NOT offline-crackable (the PMK is not derived from the passphrase)"
+  elif target_is_sae; then
+    note "transition-mode BSS: only PMKIDs from WPA2-PSK associations are crackable; SAE ones are not"
+  fi
   ts -Y "(wlan.pmkid.akms || wlan.rsn.ie.pmkid) && $(bssid_filter)" -T fields \
      -e frame.number -e wlan.sa -e wlan.da -e wlan.bssid \
      -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid \
@@ -1058,6 +1504,13 @@ pmkid() {
 #   though EAPOL (*02) lines then need hcxpcapngtool.
 export22000() {
   local out="${1:-${PCAP%.*}.hc22000}"
+  # hashcat -m 22000 recovers a PASSPHRASE. That only means anything where the PMK
+  # is PBKDF2(passphrase,SSID) — i.e. WPA2-PSK. On an SAE-only BSS the export may
+  # still produce lines, and cracking them cannot succeed.
+  if target_is_sae && ! target_has_psk; then
+    note "⚠ $SSID is WPA3-SAE only — hashcat -m 22000 cannot recover an SAE passphrase from this."
+    note "  SAE is not offline-crackable this way; capture/derive a PTK-TK or GTK instead ('h' harvest)."
+  fi
   if command -v hcxpcapngtool >/dev/null 2>&1; then
     hcxpcapngtool -o "$out" "$PCAP" >/dev/null 2>&1
     [ -s "$out" ] && ok "wrote $(hlink "file://$out" "$out")  (hcxpcapngtool: PMKID + EAPOL)" ||
@@ -1088,7 +1541,39 @@ probes() {
 #   enough to derive keys / crack. (m1&m2) or (m2&m3) => PTK-derivable & crackable.
 handshakes() {
   section "🤝 handshake completeness (per client)"
-  handshake_summary | awk -F'\t' '{printf "%-18s @ %-18s  msgs:%s  crackable:%s\n",$1,$2,$3,$4}'
+  local hs
+  hs="$(handshake_summary)"
+  if [ -n "$hs" ]; then
+    printf '%s\n' "$hs" | awk -F'\t' '{printf "%-18s @ %-18s  msgs:%s  crackable:%s\n",$1,$2,$3,$4}'
+    printf '   rows: %s\n' "$(printf '%s\n' "$hs" | grep -c .)"
+  else
+    printf '  (none observed)\n'
+  fi
+
+  # WPA3: the 4-way above is only half the story. SAE authenticates first, in
+  # Authentication frames, and a capture can hold a complete SAE with no EAPOL at
+  # all (or EAPOL that will never be crackable because the PMK came from SAE).
+  section "🔑 SAE (WPA3) authentication exchange"
+  # Only look if SAE is actually possible here. SAE authenticates TO this BSS, so if
+  # the target advertises no SAE AKM there can be no SAE frames for it — and the AKM
+  # list is already cached from load_target_bssids, making this test free. Skipping
+  # saves a full pass on every WPA2-only network. If the AKM list is empty we do not
+  # know (hidden AP, no beacons captured), so we look anyway rather than assume.
+  local sae=''
+  if target_is_sae || [ -z "$(target_akms)" ]; then
+    sae="$(sae_summary)"
+  else
+    printf '  %s(skipped — target advertises no SAE AKM, so no SAE frames can exist for it)%s\n' "$C_DIM" "$C_RESET"
+  fi
+  if [ -n "$sae" ]; then
+    printf '%s\n' "$sae" |
+      tcol $'Source\tDestination\tBSSID\tCommit\tConfirm\tStatus'
+    note "a completed SAE needs Commit and Confirm in BOTH directions; status 76 = anti-clogging token, 77 = unsupported group"
+    note "SAE-derived PMKs are not recoverable from the passphrase — the EAPOL rows above are not crackable on an SAE-only BSS"
+  elif target_is_sae; then
+    printf '  (none observed)\n'
+    note "the target advertises SAE but no SAE auth frames were captured — the association happened before this capture started"
+  fi
 }
 
 # delkey VALUE|all: remove key(s) from the keyring by matching value (or wipe all).
@@ -1652,6 +2137,21 @@ tshark_has_field() {
   printf '%s\n' "$TSHARK_FIELD_NAMES" | grep -Fx "$1" >/dev/null
 }
 
+# oui_field_name: the per-BSSID vendor field, chosen from what THIS tshark knows.
+#   WHY this exists: `wlan.bssid.oui_resolved` is not a field in Wireshark 4.2
+#   (only eth.*.oui_resolved is). Naming it made tshark reject the whole -e list
+#   with "Some fields aren't valid" and exit WITHOUT OUTPUT — and because the
+#   report's beacon pass asked for it, that pass returned nothing at all. The
+#   downstream effect was silent and severe: no identity/band/channel/RSSI table,
+#   no RSN table, and an AKM list that parsed as empty, so an encrypted network was
+#   reported as "open (no encryption)". One invalid field name, wrong verdict.
+#   Falling back to wlan.bssid_resolved keeps the column count stable (the report's
+#   awk is positional) and still carries the vendor name tshark resolved.
+oui_field_name() {
+  if tshark_has_field wlan.bssid.oui_resolved; then printf 'wlan.bssid.oui_resolved'
+  else printf 'wlan.bssid_resolved'; fi
+}
+
 # md_table HEADER_TSV: turn tab-separated rows into a clean GitHub/Obsidian table.
 # Empty cells are rendered as an em dash and an empty result is stated explicitly.
 # A blank line is emitted before AND after the block: Obsidian only renders a table
@@ -1757,6 +2257,16 @@ report() {
   report_secrets="${WIFISCOPE_REPORT_SECRETS:-1}"
   tshark_has_field ppi_gps.lat      && has_gps=1   # warm the -G fields cache once,
   tshark_has_field wlan.analysis.tk && has_tk=1    # so the parallel jobs don't re-run it
+  local sae_mt='wlan.fixed.sae_message_type'       # WPA3: absent on older tshark, so
+  tshark_has_field "$sae_mt" || sae_mt='wlan.fixed.auth_seq'   # fall back to auth seq
+  local oui_field; oui_field="$(oui_field_name)"    # invalid here = empty beacon pass
+  local -a he_f=()                                  # HE caps: absent on older tshark
+  tshark_has_field wlan.ext_tag.he_mac_caps && he_f=(-e wlan.ext_tag.he_mac_caps)
+  local -a ja_f=()                                  # JA3/JA4: absent on older tshark
+  local tls_hdr=$'Source IP\tSNI (server name)'
+  tshark_has_field tls.handshake.ja3 && { ja_f+=(-e tls.handshake.ja3); tls_hdr+=$'\tJA3'; }
+  tshark_has_field tls.handshake.ja4 && { ja_f+=(-e tls.handshake.ja4); tls_hdr+=$'\tJA4'; }
+  local assoc_f="(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\""
   D="$(mktemp -d)"
 
   { tq -T fields -E occurrence=f -e frame.number -e frame.time_epoch -e frame.time -e frame.cap_len -e frame.len \
@@ -1769,7 +2279,7 @@ report() {
       -e radiotap.channel.freq -e radiotap.dbm_antsignal \
       -e wlan.fixed.capabilities.privacy -e wlan.rsn.gcs.type -e wlan.rsn.pcs.type \
       -e wlan.rsn.akms.type -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr \
-      -e wlan.bssid.oui_resolved -e wlan.wfa.ie.wpa.version; } > "$D/bcn" &
+      -e "$oui_field" -e wlan.wfa.ie.wpa.version; } > "$D/bcn" &
   { tq -Y "$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.model_number || wps.device_name || wps.serial_number || wps.os_version)" \
       -T fields -E occurrence=f -e frame.number -e wlan.bssid -e wps.manufacturer \
       -e wps.model_name -e wps.model_number -e wps.device_name -e wps.serial_number \
@@ -1820,6 +2330,25 @@ report() {
       -e wlan.rsn.ie.igtk.kde.keyid -e wlan.rsn.ie.igtk.kde.ipn -e wlan.rsn.ie.igtk.kde.igtk \
       -e wlan.rsn.ie.bigtk_kde.key_id -e wlan.rsn.ie.bigtk_kde.bipn -e wlan.rsn.ie.bigtk_kde.bigtk \
     | awk -F'\t' -v OFS='\t' -v show="$report_secrets" '{if(!show){if($9!="")$9="REDACTED";if($12!="")$12="REDACTED";if($15!="")$15="REDACTED"}print}' | sort -u; } > "$D/gtk" &
+  { tq -Y "wlan.fixed.auth.alg==3 && $(bssid_filter)" -T fields -E occurrence=f \
+      -e frame.number -e frame.time -e wlan.sa -e wlan.da -e wlan.bssid \
+      -e "$sae_mt" -e wlan.fixed.status_code | sort -u; } > "$D/sae" &
+  { tq -Y "$assoc_f" -T fields -E aggregator=, -e wlan.sa -e wlan.sa_resolved \
+      -e wlan.ht.capabilities -e wlan.vht.capabilities "${he_f[@]}" -e radiotap.channel.freq; } > "$D/fpcap" &
+  { tq -Y "$assoc_f && wlan.country_info.code" -T fields -E occurrence=f \
+      -e wlan.sa -e wlan.country_info.code | sort -u; } > "$D/fpcountry" &
+  { tqd -Y "$(bssid_filter) && dhcp" -T fields -E aggregator=, -E occurrence=a \
+      -e dhcp.hw.mac_addr -e dhcp.ip.your -e dhcp.option.hostname \
+      -e dhcp.option.vendor_class_id -e dhcp.option.request_list_item | sort -u; } > "$D/fpdhcp" &
+  { tqd -Y "$(bssid_filter) && tls.handshake.type==1" -T fields -E occurrence=f \
+      -e ip.src -e tls.handshake.extensions_server_name "${ja_f[@]}" | sort -u; } > "$D/fptls" &
+  { tqd -Y "$(bssid_filter) && (dns.ptr.domain_name || dns.txt)" -T fields -E aggregator=, \
+      -e ip.src -e dns.ptr.domain_name -e dns.txt | sort -u; } > "$D/fpsd" &
+  { tqd -Y "$(bssid_filter) && ip" -T fields -e ip.src -e ip.ttl; } > "$D/fpttl" &
+  # Frame counts per MAC inside the target BSS — "times seen" for the selector list.
+  { tq -Y "$(bssid_filter)" -T fields -e wlan.sa -e wlan.da; } > "$D/macseen" &
+  # Every directed probe request in the capture, with the SSID sought and a count.
+  { tq -Y 'wlan.fc.type_subtype==4' -T fields -e wlan.sa -e wlan.ssid | dessid 2; } > "$D/probe_all" &
   { tq -q -z io,phs; } > "$D/phs_plain" &
   { tqd -Y "$(bssid_filter)" -q -z io,phs -z endpoints,ip -z conv,tcp -z conv,udp; } > "$D/l3stats" &
   wait
@@ -1833,6 +2362,14 @@ report() {
   phs_plain="$(cat "$D/phs_plain")"; l3stats="$(cat "$D/l3stats")"
 
   local beacon_rows security_rows wps_rows oui_rows gps_rows verdict _bcn _akms _priv _wpa1
+  local sae_rows fp_cap_rows fp_country_rows fp_dhcp_rows fp_tls_rows fp_sd_rows fp_ttl_rows
+  sae_rows="$(cat "$D/sae" 2>/dev/null)"
+  fp_cap_rows="$(wifi_generation < "$D/fpcap" 2>/dev/null)"
+  fp_country_rows="$(cat "$D/fpcountry" 2>/dev/null)"
+  fp_dhcp_rows="$(cat "$D/fpdhcp" 2>/dev/null)"
+  fp_tls_rows="$(cat "$D/fptls" 2>/dev/null)"
+  fp_sd_rows="$(cat "$D/fpsd" 2>/dev/null)"
+  fp_ttl_rows="$(ttl_os_hint < "$D/fpttl" 2>/dev/null)"
   _bcn="$(cat "$D/bcn")"
   beacon_rows="$(printf '%s\n' "$_bcn" | dessid 4 \
     | awk -F'\t' -v OFS='\t' '
@@ -1848,10 +2385,30 @@ report() {
   oui_rows="$(printf '%s\n' "$_bcn" \
     | awk -F'\t' -v OFS='\t' '{for(i=1;i<=NF;i++){k=index($i,"|");if(k)$i=substr($i,1,k-1)} print $2,$3,$15}' | sort -u)"
   gps_rows="$([ -f "$D/gps" ] && cat "$D/gps")"
-  _akms="$(printf '%s\n' "$_bcn" | cut -f12 | tr '|' '\n' | tr -d ' ' | sort -u | grep .)"
-  _priv="$(printf '%s\n' "$_bcn" | cut -f9  | tr '|' '\n' | tr -d ' ' | sort -u | grep -m1 1)"
+  _akms="$(printf '%s\n' "$_bcn" | cut -f12 | tr '|,' '\n\n' | tr -d ' ' | grep -E '^[0-9]+$' | sort -un)"
+  # tshark renders the privacy bit as "True"/"False", so the old `grep 1` never
+  # matched it — a WEP network (privacy set, no RSN) was reported as "open".
+  _priv="$(printf '%s\n' "$_bcn" | cut -f9  | tr '|,' '\n\n' | tr -d ' ' | sort -u | grep -m1 -ixE '1|true')"
   _wpa1="$(printf '%s\n' "$_bcn" | awk -F'\t' '$16!=""{print $2; exit}')"
-  verdict="$(printf '%s\n' "$_akms" | classify_akm "$_priv" "$_wpa1" | cut -f2)"
+  local _cls
+  IFS=$'\t' read -r _cls verdict < <(printf '%s\n' "$_akms" | classify_akm "$_priv" "$_wpa1")
+  # Summary facts, all derived from passes that have already completed.
+  local _mfpc _mfpr pmf_label pmf_glyph sec_glyph sae_count fp_client_count fp_random_count
+  _mfpc="$(printf '%s\n' "$_bcn" | cut -f13 | tr '|,' '\n\n' | tr -d ' ' | sort -u | grep -m1 -ixE '1|true')"
+  _mfpr="$(printf '%s\n' "$_bcn" | cut -f14 | tr '|,' '\n\n' | tr -d ' ' | sort -u | grep -m1 -ixE '1|true')"
+  if   [ -n "$_mfpr" ]; then pmf_label='required';              pmf_glyph='✅'
+  elif [ -n "$_mfpc" ]; then pmf_label='capable, not required';  pmf_glyph='⚠️'
+  else                       pmf_label='absent — deauth/disassoc spoofing works'; pmf_glyph='❌'; fi
+  # WPA2-PSK is dated, not broken: it earns a caution, not a failure. Only an
+  # actually-unprotected link (open / WEP / WPA1) gets the hard mark.
+  case "$_cls" in
+    strong|ent)  sec_glyph='✅' ;;
+    trans|weak)  sec_glyph='⚠️' ;;
+    *)           sec_glyph='❌' ;;
+  esac
+  sae_count="$(printf '%s\n' "$sae_rows" | grep -c '[^[:space:]]')"
+  fp_client_count="$(printf '%s\n' "$fp_cap_rows" | grep -c '[^[:space:]]')"
+  fp_random_count="$(printf '%s\n' "$fp_cap_rows" | grep -c 'randomized')"
 
   local eapol_rows hs_rows pmkid_rows pmkid_count m3_count _eapol
   _eapol="$(cat "$D/eapol")"
@@ -1892,17 +2449,32 @@ report() {
   probe_rows="$(cat "$D/probe")"
 
   local keyring_rows key_analysis_rows gtk_rows gtk_count
+  # Key inventory carries a "what it is" column: a bare  tk / wpa-psk / wpa-pwd
+  # column does not tell the reader which secret they are holding or what it opens.
   keyring_rows=""
+  local _kt _kv
   if [ -s "$KEYRING" ]; then
     if [ "$report_secrets" = 1 ]; then
-      keyring_rows="$(awk -F'\t' 'BEGIN{OFS="\t"}$1!=""{print $1,$2}' "$KEYRING" | sort -u)"
+      while IFS=$'\t' read -r _kt _kv; do
+        [ -n "$_kt" ] || continue
+        keyring_rows+="${keyring_rows:+$'\n'}${_kt}"$'\t'"$(key_type_label "$_kt")"$'\t'"\`${_kv}\`"
+      done < <(LC_ALL=C sort -u "$KEYRING")
     else
-      keyring_rows="$(awk -F'\t' 'BEGIN{OFS="\t"}$1!=""{n[$1]++}END{for(k in n)print k,n[k]" stored value(s) (redacted)"}' "$KEYRING" | sort)"
+      while IFS=$'\t' read -r _kt _kv; do
+        [ -n "$_kt" ] || continue
+        keyring_rows+="${keyring_rows:+$'\n'}${_kt}"$'\t'"$(key_type_label "$_kt")"$'\t'"${_kv}"
+      done < <(awk -F'\t' 'BEGIN{OFS="\t"}$1!=""{n[$1]++}END{for(k in n)print k,n[k]" stored value(s) — REDACTED"}' "$KEYRING" | LC_ALL=C sort)
     fi
   fi
+  local keyring_count=0
+  [ -s "$KEYRING" ] && keyring_count="$(grep -c . "$KEYRING")"
   key_analysis_rows="$([ -f "$D/keyanalysis" ] && cat "$D/keyanalysis")"
   gtk_rows="$(cat "$D/gtk")"
   gtk_count="$(printf '%s\n' "$gtk_rows" | grep -c '[^[:space:]]')"
+  # Mission-report selector inputs: read them here, while $D still exists.
+  local macseen_rows probe_all_rows
+  macseen_rows="$(cat "$D/macseen" 2>/dev/null)"
+  probe_all_rows="$(cat "$D/probe_all" 2>/dev/null)"
   rm -rf "$D"
 
   local gateway gateway_mac handshake_good station_count wds_count
@@ -1912,11 +2484,99 @@ report() {
   station_count="$(printf '%s\n' "$station_rows" | grep -c '[^[:space:]]')"
   wds_count="$(printf '%s\n' "$wds_rows" | grep -c '[^[:space:]]')"
 
+  # ---- mission-report facts (all from passes already completed) --------------
+  local op_author op_name op_date
+  op_author="${WIFISCOPE_AUTHOR:-${SUDO_USER:-${USER:-unknown}}}"
+  op_name="${WIFISCOPE_OPNAME:-${SSID:-UNNAMED}}"
+  op_date="${generated%%T*}"
+
+  # Make / model / firmware from the WPS identity rows (frame,bssid,mfr,model,
+  # model#,device,serial,os_version). First non-empty wins; WPS is the only place
+  # most APs state their own identity.
+  local ap_make ap_model ap_modelnum ap_device ap_serial ap_fw
+  ap_make="$(printf '%s\n'   "$wps_rows" | awk -F'\t' '$3!=""{print $3;exit}')"
+  ap_model="$(printf '%s\n'  "$wps_rows" | awk -F'\t' '$4!=""{print $4;exit}')"
+  ap_modelnum="$(printf '%s\n' "$wps_rows" | awk -F'\t' '$5!=""{print $5;exit}')"
+  ap_device="$(printf '%s\n' "$wps_rows" | awk -F'\t' '$6!=""{print $6;exit}')"
+  ap_serial="$(printf '%s\n' "$wps_rows" | awk -F'\t' '$7!=""{print $7;exit}')"
+  ap_fw="$(printf '%s\n'     "$wps_rows" | awk -F'\t' '$8!=""{print $8;exit}')"
+  # Firmware also leaks from the router's own HTTP Server banner once decrypted.
+  # ...and it also leaks from the router's own HTTP Server banner (column 27 of the
+  # decrypted L3 pass) once decryption is working.
+  [ -z "$ap_fw" ] && ap_fw="$(printf '%s\n' "$_l3" | awk -F'\t' '$27!=""{print $27;exit}')"
+
+  # Per-band BSSIDs, channels and frequencies come from beacon_rows:
+  #   1 bssid  2 ssid  3 vendor  4 band  5 channel  6 freq  7 avg  8 min  9 max  10 samples
+  local mac24 mac5 mac6 ch_list freq_list rssi_best rssi_best_bssid
+  mac24="$(printf '%s\n' "$beacon_rows" | awk -F'\t' '$4=="2.4 GHz"{print $1}' | paste -sd, - | sed 's/,/, /g')"
+  mac5="$(printf '%s\n'  "$beacon_rows" | awk -F'\t' '$4=="5 GHz"{print $1}'   | paste -sd, - | sed 's/,/, /g')"
+  mac6="$(printf '%s\n'  "$beacon_rows" | awk -F'\t' '$4=="6 GHz"{print $1}'   | paste -sd, - | sed 's/,/, /g')"
+  ch_list="$(printf '%s\n' "$beacon_rows" | awk -F'\t' '$5!=""{print $5}' | sort -un | paste -sd, - | sed 's/,/, /g')"
+  freq_list="$(printf '%s\n' "$beacon_rows" | awk -F'\t' '$6!=""{print $6}' | sort -un | paste -sd, - | sed 's/,/, /g')"
+  rssi_best="$(printf '%s\n' "$beacon_rows" | awk -F'\t' '$9!=""{if(b==""||$9+0>b+0){b=$9;m=$1}}END{print b}')"
+  rssi_best_bssid="$(printf '%s\n' "$beacon_rows" | awk -F'\t' '$9!=""{if(b==""||$9+0>b+0){b=$9;m=$1}}END{print m}')"
+
+  # Estimated location: the collector position recorded on the strongest beacon.
+  # This is where the RADIO was heard best, which is the standard field estimate —
+  # it is NOT a survey fix on the AP, and the report says so where it prints it.
+  # Keep lat/lon/alt as separate values: building a map URL out of a formatted
+  # string means re-parsing your own output, and that breaks the first time the
+  # format changes.
+  local est_lat est_lon est_alt est_loc=''
+  IFS=$'\t' read -r est_lat est_lon est_alt < <(printf '%s\n' "$gps_rows" | awk -F'\t' -v OFS='\t' '
+      $3!="" && $4!="" { r=($7==""?-999:$7+0); if(b==""||r>b){b=r;la=$3;lo=$4;al=$5} }
+      END{ if(la!="") print la, lo, al }')
+  if [ -n "${est_lat:-}" ]; then
+    est_loc="$est_lat, $est_lon${est_alt:+ (alt $est_alt m)}"
+  fi
+
+  # Selector lists. Associated = a station with association/EAPOL/data evidence on a
+  # target BSSID (station_rows); times-seen counts every frame it sent or received.
+  local assoc_selectors probe_selectors wired_selectors
+  assoc_selectors="$(printf '%s\n' "$station_rows" |
+    awk -F'\t' '$1!=""{print tolower($1)}' | sort -u |
+    awk -v caps="$(printf '%s\n' "$fp_cap_rows" | awk -F'\t' -v OFS='|' '{print tolower($1),$2,$3,$4}' | paste -sd';' -)" \
+        -v counts="$(printf '%s\n' "$macseen_rows" | awk -F'\t' '{for(i=1;i<=2;i++) if($i!="") c[tolower($i)]++} END{for(m in c) printf "%s|%s;", m, c[m]}')" '
+      BEGIN{ n=split(caps,A,";"); for(i=1;i<=n;i++){ if(A[i]=="")continue; split(A[i],f,"|"); V[f[1]]=f[2]; T[f[1]]=f[3]; G[f[1]]=f[4] }
+             n=split(counts,B,";"); for(i=1;i<=n;i++){ if(B[i]=="")continue; split(B[i],f,"|"); C[f[1]]=f[2] } }
+      { m=$0
+        v=(V[m]==""||V[m]=="—") ? "OUI not resolved" : V[m]
+        t=(T[m]=="") ? ((tolower(substr(m,2,1)) ~ /^[26ae]$/) ? "randomized" : "hardware") : T[m]
+        g=(G[m]=="") ? "" : ", " G[m]
+        printf "- **%s**: %s, %s MAC%s, seen in %d frame(s)\n", m, v, t, g, C[m]+0 }')"
+
+  probe_selectors="$(printf '%s\n' "$probe_all_rows" | awk -F'\t' -v aps="${ALL_BSSIDS[*]}" '
+      BEGIN{ n=split(aps,a," "); for(i=1;i<=n;i++) AP[tolower(a[i])]=1 }
+      $1!="" { m=tolower($1); if(m in AP) next
+               c[m]++; if($2!="" && !(seen[m SUBSEP $2]++)) s[m]=s[m] (s[m]?", ":"") $2 }
+      END{ for(m in c) printf "- **%s**: %s MAC, %d probe request(s)%s\n", m,
+             ((tolower(substr(m,2,1)) ~ /^[26ae]$/) ? "randomized" : "hardware"), c[m],
+             (s[m]==""?"":", sought: " s[m]) }' | sort)"
+
+  # Wired = a MAC that owns an IP in the decrypted L2 traffic but is neither an AP,
+  # nor a wireless station of this BSS, nor the default gateway. Seeing a device's
+  # IP without ever seeing it associate is the evidence that it is on cable.
+  wired_selectors="$(printf '%s\n' "$_l3" | awk -F'\t' -v OFS='\t' '
+      { if($12!="" && $11!="") print tolower($12), $11
+        if($3!=""  && $5!="")  print tolower($3),  $5
+        if($16!="" && $15!="") print tolower($16), $15 }' | sort -u |
+    awk -F'\t' -v aps="${ALL_BSSIDS[*]}" \
+        -v sta="$(printf '%s\n' "$station_rows" | awk -F'\t' '{print tolower($1)}' | paste -sd' ' -)" \
+        -v gwm="$(printf '%s' "$gateway_mac" | tr 'A-Z' 'a-z')" -v gwi="$gateway" '
+      BEGIN{ n=split(aps,a," "); for(i=1;i<=n;i++) AP[tolower(a[i])]=1
+             n=split(sta,b," "); for(i=1;i<=n;i++) ST[tolower(b[i])]=1 }
+      $1!="" && $2!="" {
+        m=$1; if(m in AP || m in ST || m==gwm) next
+        if(tolower(substr(m,2,1)) ~ /[13579bdf]/) next          # group-addressed
+        if(!(seen[m]++)) printf "- **%s**: %s — no association or handshake seen, so wired (or on another BSS)\n", m, $2 }' | sort)"
+
   # Dynamic scope: the report is always plain Markdown, independent of terminal UX.
   local C_RESET= C_B= C_DIM= C_RED= C_GRN= C_YEL= C_BLU= C_MAG= C_CYN= C_ORG= UX_LINKS=0
   {
     echo '---'
-    printf "title: 'WiFiScope autopsy — %s'\n" "${SSID//\'/\'\'}"
+    printf "author: '%s'\n" "${op_author//\'/\'\'}"
+    printf "date: '%s'\n" "$op_date"
+    printf "title: '%s Mission Report'\n" "${op_name//\'/\'\'}"
     printf "ssid: '%s'\n" "${SSID//\'/\'\'}"
     printf "pcap: '%s'\n" "${PCAP//\'/\'\'}"
     printf "generated_utc: '%s'\n" "$generated"
@@ -1928,11 +2588,35 @@ report() {
     echo 'tags: [wiboc, wifi, pcap, autopsy, wifiscope]'
     echo '---'
     echo
-    echo "# WiFiScope autopsy — $SSID"
+    echo "# $op_name Mission Report"
     echo
     echo "> Evidence scope: packet observations from \`$PCAP\`. **Observed** means a field/frame is present; **inferred** means a role is derived from multiple observations; **not observed** is not proof of absence."
     echo
     echo "Matching diagram: [${mapout##*/}](${mapout##*/})"
+    echo
+    # A 12-section evidence dump is unnavigable without an index. GitHub and
+    # Obsidian both derive heading anchors the same way (lowercase, spaces and
+    # dots to hyphens), so one list of links works in either renderer.
+    echo '## Contents'
+    echo
+    echo '**Mission report** — [Survey Imagery](#survey-imagery) · [Targets](#targets) · [Router Info](#router-info) · [Handshakes](#handshakes) · [Selectors of Interest](#selectors-of-interest) · [Actions Taken](#actions-taken) · [Notes](#notes)'
+    echo
+    echo '**Detailed evidence**'
+    echo
+    echo '| # | Section | What it answers |'
+    echo '| --- | --- | --- |'
+    echo '| 1 | [Capture overview and integrity](#1-capture-overview-and-integrity) | Is this capture whole and untampered? |'
+    echo '| 2 | [Router identity, band, channel, signal](#2-router-identity-band-channel-frequency-and-signal) | Which radios, where, how strong? |'
+    echo '| 3 | [Encryption, ciphers, PMF, hardware](#3-encryption-ciphers-pmf-and-hardware-identity) | What protects it, and what is the AP? |'
+    echo '| 4 | [GPS collection evidence](#4-gps-collection-evidence) | Where was the collector? |'
+    echo '| 5 | [EAPOL handshake, PMKID, SAE](#5-eapol-handshake-and-pmkid-evidence) | Is there crackable/derivable key context? |'
+    echo '| 6 | [Decryption validation and key inventory](#6-decryption-validation-and-key-inventory) | Which keys do we hold, and do they work? |'
+    echo '| 7 | [DHCP, subnet, gateway, ARP, IPv6, names](#7-dhcp-subnet-gateway-arp-ipv6-and-names) | What is the network layout? |'
+    echo '| 8 | [Station, management-action, topology](#8-wireless-station-management-action-and-topology-evidence) | Who was on it and how do the APs link? |'
+    echo '| 9 | [Device fingerprinting](#9-device-fingerprinting) | What kind of devices are these? |'
+    echo '| 10 | [Decrypted DNS and software evidence](#10-decrypted-dns-and-software-evidence) | What were they talking to? |'
+    echo '| 11 | [Capture-quality checks](#11-capture-quality-checks) | How much should we trust the above? |'
+    echo '| 12 | [Limitations, gaps, and questions](#12-limitations-gaps-and-questions) | What this capture cannot tell us. |'
     echo
     echo '<details><summary>Paste once: table helpers + key set used by the commands below</summary>'
     echo
@@ -1974,6 +2658,181 @@ KEYS_TMPL
     echo '```'
     echo '</details>'
     echo
+    # ---- MISSION REPORT: the answers first, evidence tables afterwards -------
+    # Everything here is a summary of the numbered sections below; each block names
+    # the tshark command that produced it so a reader can re-derive any single line.
+    echo '# Survey Imagery'
+    echo
+    if [ -n "$est_loc" ]; then
+      echo "Collector track recorded in this capture. Strongest-signal collection point: \`$est_loc\`."
+      echo
+      echo "- Map: [OpenStreetMap](https://www.openstreetmap.org/?mlat=${est_lat}&mlon=${est_lon}#map=18/${est_lat}/${est_lon})"
+      echo "- Full GPS track: [section 4](#4-gps-collection-evidence)"
+    else
+      echo '_No GPS metadata in this capture (no PPI-GPS header). Attach survey photos, a site sketch, or a heat-map export here._'
+    fi
+    echo
+    echo "- Network diagram: [${mapout##*/}](${mapout##*/})"
+    echo
+
+    echo '# Targets'
+    echo
+    echo '## Router Info'
+    echo
+    printf -- '- **Make:** %s\n'              "${ap_make:-_not advertised (no WPS identity)_}"
+    printf -- '- **Model:** %s\n'             "${ap_model:-_not advertised_}"
+    printf -- '- **Model number:** %s\n'      "${ap_modelnum:-_not advertised_}"
+    printf -- '- **Device name:** %s\n'       "${ap_device:-_not advertised_}"
+    printf -- '- **Serial:** %s\n'            "${ap_serial:-_not advertised_}"
+    printf -- '- **Firmware:** %s\n'          "${ap_fw:-_not observed (no WPS OS version, no HTTP Server banner)_}"
+    printf -- '- **2.4GHz MAC:** %s\n'        "${mac24:-_none beaconing on 2.4 GHz_}"
+    printf -- '- **5GHz MAC:** %s\n'          "${mac5:-_none beaconing on 5 GHz_}"
+    printf -- '- **6GHz MAC:** %s\n'          "${mac6:-_none beaconing on 6 GHz_}"
+    printf -- '- **Channels:** %s\n'          "${ch_list:-_not advertised_}"
+    printf -- '- **Frequencies:** %s MHz\n'   "${freq_list:-—}"
+    printf -- '- **SSID:** %s\n'              "$SSID"
+    printf -- '- **Encryption:** %s %s — PMF %s %s\n' "$sec_glyph" "$verdict" "$pmf_glyph" "$pmf_label"
+    printf -- '- **Estimated Location:** %s\n' "${est_loc:-_no GPS in capture_}"
+    printf -- '- **Strongest RSSI:** %s\n'    "$([ -n "$rssi_best" ] && printf '%s dBm (on %s)' "$rssi_best" "$rssi_best_bssid" || printf '_no radiotap signal data_')"
+    echo
+    echo '> [!note] Estimated Location is the **collector** position recorded on the strongest beacon, not a survey fix on the AP. Make/model/firmware come from what the AP advertises about itself; an AP with an empty WPS IE states nothing, which is why those lines can be blank on a perfectly healthy capture.'
+    echo
+    echo '<details><summary>How this was derived with TShark</summary>'
+    echo
+    echo '```bash'
+    echo '# Identity (make / model / firmware) — WPS is where an AP names itself:'
+    echo "tshark -r '${PCAP##*/}' -Y '$(bssid_filter) && (wps.manufacturer || wps.model_name || wps.os_version)' \\"
+    echo "  -T fields -e wlan.bssid -e wps.manufacturer -e wps.model_name -e wps.model_number \\"
+    echo "  -e wps.device_name -e wps.serial_number -e wps.os_version"
+    echo
+    echo '# Per-band MAC, channel, frequency and RSSI (band is derived from frequency):'
+    echo "tshark -r '${PCAP##*/}' -Y '$(beacons_of_target)' \\"
+    echo "  -T fields -e wlan.bssid -e wlan.ds.current_channel -e wlan.ht.info.primarychannel \\"
+    echo "  -e radiotap.channel.freq -e radiotap.dbm_antsignal"
+    echo
+    echo '# Encryption and PMF:'
+    echo "tshark -r '${PCAP##*/}' -Y '$(beacons_of_target)' \\"
+    echo "  -T fields -e wlan.rsn.akms.type -e wlan.rsn.gcs.type -e wlan.rsn.pcs.type \\"
+    echo "  -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr -e wlan.fixed.capabilities.privacy"
+    echo
+    echo '# Collector position per beacon (needs a PPI-GPS capture):'
+    echo "tshark -r '${PCAP##*/}' -Y 'ppi_gps.lat && ppi_gps.lon && $(beacons_of_target)' \\"
+    echo "  -T fields -e ppi_gps.lat -e ppi_gps.lon -e ppi_gps.alt -e ppi.80211-common.dbm.antsignal"
+    echo '```'
+    echo '</details>'
+    echo
+
+    echo '### Handshakes'
+    echo
+    printf -- '- **Recoverable 4-way contexts:** %s of %s station/BSSID pair(s) (M1+M2 or M2+M3 observed)\n' \
+      "$handshake_good" "$(printf '%s\n' "$hs_rows" | grep -c '[^[:space:]]')"
+    printf -- '- **PMKID rows:** %s\n' "$pmkid_count"
+    printf -- '- **SAE (WPA3) auth frames:** %s\n' "$sae_count"
+    printf -- '- **Keys held:** %s\n' "$([ "$keyring_count" -gt 0 ] && printf '%s (see §6)' "$keyring_count" || printf 'none')"
+    echo
+    printf '%s\n' "$hs_rows" | md_table $'Station\tBSSID\tMessages 1–4\tPTK/offline-check context usable'
+    if [ "$sae_count" -gt 0 ]; then
+      echo '> [!important] SAE frames are present. An SAE PMK comes from the elliptic-curve exchange, not from `PBKDF2(passphrase, SSID)` — so for SAE sessions the passphrase cannot decrypt and the 4-way above is not offline-crackable. Harvested PTK-TK / GTK material is required.'
+      echo
+    fi
+    echo '<details><summary>How this was derived with TShark</summary>'
+    echo
+    echo '```bash'
+    echo '# 4-way messages per station (msgnr 1..4); WiFiScope folds them into a mask:'
+    echo "tshark -r '${PCAP##*/}' -Y 'eapol && $(bssid_filter)' \\"
+    echo "  -T fields -e wlan.sa -e wlan.da -e wlan.bssid -e wlan_rsna_eapol.keydes.msgnr"
+    echo
+    echo '# Client-less PMKID (carried in association RSN as well as EAPOL):'
+    echo "tshark -r '${PCAP##*/}' -Y '$(bssid_filter) && (wlan.pmkid.akms || wlan.rsn.ie.pmkid)' \\"
+    echo "  -T fields -e wlan.sa -e wlan.bssid -e wlan.rsn.ie.pmkid"
+    echo
+    echo '# WPA3 SAE lives in Authentication frames, algorithm 3 (1=Commit, 2=Confirm):'
+    echo "tshark -r '${PCAP##*/}' -Y 'wlan.fixed.auth.alg==3 && $(bssid_filter)' \\"
+    echo "  -T fields -e wlan.sa -e wlan.da -e $sae_mt -e wlan.fixed.status_code"
+    echo '```'
+    echo '</details>'
+    echo
+
+    echo '## Selectors of Interest'
+    echo
+    echo '### Associated MACs'
+    echo
+    if [ -n "$assoc_selectors" ]; then printf '%s\n' "$assoc_selectors"; else echo '_None observed._'; fi
+    echo
+    echo '_"Randomized" means the U/L bit is set (a locally administered address): the device is rotating its MAC and cannot be correlated to another session. "Hardware" means a real OUI, which can._'
+    echo
+    echo '<details><summary>How this was derived with TShark</summary>'
+    echo
+    echo '```bash'
+    echo '# Association evidence (a station that asked to join this SSID):'
+    echo "tshark -r '${PCAP##*/}' -Y '(wlan.fc.type_subtype==0 || wlan.fc.type_subtype==2) && wlan.ssid==\"$SSID\"' \\"
+    echo "  -T fields -e wlan.sa -e wlan.sa_resolved -e wlan.bssid"
+    echo
+    echo '# Data-frame evidence, uplink then downlink (a station actually using the BSS):'
+    echo "tshark -r '${PCAP##*/}' -Y 'wlan.fc.type==2 && wlan.fc.tods==1 && wlan.fc.fromds==0 && $(bssid_filter)' -T fields -e wlan.sa -e wlan.bssid"
+    echo "tshark -r '${PCAP##*/}' -Y 'wlan.fc.type==2 && wlan.fc.tods==0 && wlan.fc.fromds==1 && $(bssid_filter)' -T fields -e wlan.da -e wlan.bssid"
+    echo
+    echo '# Times seen = every frame to or from the MAC inside the target BSS:'
+    echo "tshark -r '${PCAP##*/}' -Y '$(bssid_filter)' -T fields -e wlan.sa -e wlan.da"
+    echo '```'
+    echo '</details>'
+    echo
+
+    echo '### Wired MACs'
+    echo
+    if [ -n "$wired_selectors" ]; then printf '%s\n' "$wired_selectors"; else echo '_None observed (needs working decryption to see L2/L3 at all)._'; fi
+    echo
+    echo '_A MAC that owns an IP in the decrypted traffic but never associated and never handshaked is reached over cable — or sits on a BSS this capture did not cover. The default gateway is excluded; it is reported separately in the executive summary._'
+    echo
+    echo '<details><summary>How this was derived with TShark</summary>'
+    echo
+    echo '```bash'
+    echo '# MAC<->IP ownership from ARP, from the DHCP lease, and from IPv6 ND:'
+    echo "tshark -r '${PCAP##*/}' \"\${KEYS[@]}\" -Y '$(bssid_filter) && (arp || dhcp || (icmpv6 && icmpv6.opt.linkaddr))' \\"
+    echo "  -T fields -e arp.src.hw_mac -e arp.src.proto_ipv4 -e dhcp.hw.mac_addr -e dhcp.ip.your \\"
+    echo "  -e icmpv6.opt.linkaddr -e ipv6.src"
+    echo '# ...then subtract every BSSID, every associated station, and the gateway.'
+    echo '```'
+    echo '</details>'
+    echo
+
+    echo '### Probing MACs'
+    echo
+    if [ -n "$probe_selectors" ]; then printf '%s\n' "$probe_selectors"; else echo '_None observed._'; fi
+    echo
+    echo '_Directed probe requests name the SSIDs a device is looking for — including networks that are not present here. That list is a travel history, and it is broadcast in the clear with no association required._'
+    echo
+    echo '<details><summary>How this was derived with TShark</summary>'
+    echo
+    echo '```bash'
+    echo '# Every directed probe request in the capture (subtype 4 with a named SSID):'
+    echo "tshark -r '${PCAP##*/}' -Y 'wlan.fc.type_subtype==4' -T fields -e wlan.sa -e wlan.ssid"
+    echo '# wlan.ssid is hex under -T fields; WiFiScope decodes it to text.'
+    echo '```'
+    echo '</details>'
+    echo
+
+    echo '# Actions Taken'
+    echo
+    echo '<!-- Operator log: what was done, when, and under what authority. -->'
+    echo
+    printf -- '- %s — capture `%s` (%s bytes, SHA-256 `%s`) analysed with WiFiScope %s\n' \
+      "$generated" "${PCAP##*/}" "$capture_bytes" "$capture_hash" "$VERSION"
+    printf -- '- Decryption: %s%s\n' "$decrypt_label" \
+      "$([ "$keyring_count" -gt 0 ] && printf ' (%s key(s) in %s)' "$keyring_count" "${KEYRING##*/}" || printf '')"
+    echo '-'
+    echo
+    echo '# Notes'
+    echo
+    echo '<!-- Free-form operator notes. Everything below this line is machine-generated evidence. -->'
+    echo '-'
+    echo
+    echo '---'
+    echo
+    echo '# Detailed evidence'
+    echo
+    echo 'Each section below states the observation and the exact command that produced it.'
+    echo
     echo '## Executive summary'
     echo
     printf '| Item | Result | Confidence |\n| --- | --- | --- |\n'
@@ -2014,7 +2873,8 @@ KEYS_TMPL
     echo
     echo "**Interpreted verdict:** $verdict"
     echo
-    printf '%s\n' "$security_rows" | md_table $'BSSID\tPrivacy bit\tGroup cipher\tPairwise cipher\tAKM suites\tPMF capable\tPMF required'
+    printf '%s\n' "$security_rows" | rsn_decode_row |
+      md_table $'BSSID\tPrivacy bit\tGroup cipher\tPairwise cipher\tAKM suites\tPMF capable\tPMF required'
     report_command 0 'table_unique' -Y "$(beacons_of_target)" -T fields -E separator=/t -E occurrence=f -E header=y \
       -e wlan.bssid -e wlan.fixed.capabilities.privacy -e wlan.rsn.gcs.type \
       -e wlan.rsn.pcs.type -e wlan.rsn.akms.type -e wlan.rsn.capabilities.mfpc -e wlan.rsn.capabilities.mfpr
@@ -2027,7 +2887,7 @@ KEYS_TMPL
     echo; echo '### OUI/vendor fallback'
     printf '%s\n' "$oui_rows" | md_table $'BSSID\tResolved BSSID\tOUI vendor'
     report_command 0 'table_unique' -Y "$(beacons_of_target)" -T fields -E separator=/t -E occurrence=f -E header=y \
-      -e wlan.bssid -e wlan.bssid_resolved -e wlan.bssid.oui_resolved
+      -e wlan.bssid -e wlan.bssid_resolved -e "$oui_field"
 
     echo; echo '## 4. GPS collection evidence'
     printf '%s\n' "$gps_rows" | md_table $'Time\tBSSID\tCollector latitude\tCollector longitude\tAltitude\tEstimated horizontal error\tSignal dBm'
@@ -2055,6 +2915,18 @@ KEYS_TMPL
       -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e frame.time \
       -e wlan.fc.type_subtype -e wlan.sa -e wlan.da -e wlan.bssid -e wlan.pmkid.akms -e wlan.rsn.ie.pmkid
 
+    echo; echo '### SAE (WPA3) authentication exchange'
+    printf '%s\n' "$sae_rows" | md_table $'Frame\tTime\tSource\tDestination\tBSSID\tSAE message (1=Commit, 2=Confirm)\tStatus code'
+    echo
+    echo '_SAE precedes the 4-way handshake and lives in Authentication frames (algorithm 3). A complete exchange shows Commit and Confirm in both directions. Status 76 = anti-clogging token required, 77 = unsupported finite cyclic group._'
+    if [ -n "$sae_rows" ]; then
+      echo
+      echo '> [!important] This BSS authenticates with SAE. The SAE PMK is an output of the elliptic-curve exchange, not `PBKDF2(passphrase, SSID)`. A correct passphrase therefore cannot decrypt SAE sessions and the EAPOL/PMKID evidence above is not offline-crackable for them — decryption requires harvested PTK-TK / GTK material.'
+    fi
+    report_command 0 'table_unique' -Y "wlan.fixed.auth.alg==3 && $(bssid_filter)" \
+      -T fields -E separator=/t -E occurrence=f -E header=y -e frame.number -e frame.time \
+      -e wlan.sa -e wlan.da -e wlan.bssid -e "$sae_mt" -e wlan.fixed.status_code
+
     echo; echo '## 6. Decryption validation and key inventory'
     echo
     printf '| Check | Result |\n| --- | --- |\n| Decryption options loaded | %s |\n| Target DHCP/ARP/IP/IPv6 frames decoded | %s |\n| Secret values in this report | %s |\n' \
@@ -2062,9 +2934,13 @@ KEYS_TMPL
     echo
     report_command 1 'wc -l' -Y "$(bssid_filter) && (dhcp || arp || ip || ipv6)"
     echo; echo '### Stored keyring inventory'
-    printf '%s\n' "$keyring_rows" | md_table $'Key type\tValue or count'
+    printf '%s\n' "$keyring_rows" | md_table $'Key type\tWhat it is\tValue'
     echo
-    echo "> [!warning] This report includes full key material (passphrase, PMK, PTK, GTK). Set \`WIFISCOPE_REPORT_SECRETS=0\` to redact it before sharing outside a controlled training artifact."
+    if [ "$report_secrets" = 1 ]; then
+      echo "> [!warning] This report includes full key material (passphrase, PMK, PTK, GTK). Set \`WIFISCOPE_REPORT_SECRETS=0\` to redact it before sharing outside a controlled training artifact."
+    else
+      echo "> [!note] Key material is redacted in this report (\`WIFISCOPE_REPORT_SECRETS=0\`). Counts are shown instead of values; re-run without that variable to include them."
+    fi
     echo; echo '### PTK components selected/derived by Wireshark'
     printf '%s\n' "$key_analysis_rows" | md_table $'Frame\tTime\tBSSID\tStation\tMessage\tReplay counter\tPMK\tKCK\tKEK\tTK'
     if tshark_has_field wlan.analysis.tk; then
@@ -2136,7 +3012,52 @@ KEYS_TMPL
     report_command 0 'table_unique' -Y 'wlan.fc.type_subtype==4 && wlan.ssid!=""' \
       -T fields -E separator=/t -E occurrence=f -E header=y -e wlan.sa -e wlan.ssid
 
-    echo; echo '## 9. Decrypted DNS and software evidence'
+    echo; echo '## 9. Device fingerprinting'
+    echo
+    echo 'Who and what the clients are, separated by what the evidence requires. The 802.11 capability profile needs no keys at all; everything after it needs decryption.'
+    echo; echo '### 802.11 client capability profile (no decryption required)'
+    printf '%s\n' "$fp_cap_rows" | md_table $'Station\tVendor (OUI)\tMAC type\tGeneration\tHT (11n)\tVHT (11ac)\tHE (11ax)'
+    echo
+    echo '_Generation is read from the capability elements in the association request: HE (802.11ax) = Wi-Fi 6, and Wi-Fi 6E when it associated above 5925 MHz; VHT = Wi-Fi 5; HT = Wi-Fi 4. Wireshark 4.2 exposes no EHT capability field, so Wi-Fi 7 is not claimed here. "MAC type" reads the U/L bit: a randomized (locally administered) address cannot be correlated across sessions, a hardware OUI can._'
+    report_command 0 'table_unique' -Y "$assoc_f" -T fields -E separator=/t -E header=y -E aggregator=, \
+      -e wlan.sa -e wlan.sa_resolved -e wlan.ht.capabilities -e wlan.vht.capabilities "${he_f[@]}" -e radiotap.channel.freq
+
+    echo; echo '### Regulatory domain advertised by clients'
+    printf '%s\n' "$fp_country_rows" | md_table $'Station\tCountry code'
+    report_command 0 'table_unique' -Y "$assoc_f && wlan.country_info.code" \
+      -T fields -E separator=/t -E occurrence=f -E header=y -e wlan.sa -e wlan.country_info.code
+
+    echo; echo '### DHCP identity and option-55 parameter-request signature'
+    printf '%s\n' "$fp_dhcp_rows" | md_table $'Client MAC\tAssigned IP\tHostname\tVendor class (60)\tParameter request list (55)'
+    echo
+    echo '_DHCP option 55 is the ordered list of options a client asks for, and that order is a stable per-OS signature (the basis of the classic p0f/fingerbank DHCP fingerprint). It separates Android from iOS from Windows even when the hostname is generic or absent._'
+    report_command 1 'table_unique' -Y "$(bssid_filter) && dhcp" -T fields -E separator=/t -E header=y \
+      -E aggregator=, -E occurrence=a -e dhcp.hw.mac_addr -e dhcp.ip.your -e dhcp.option.hostname \
+      -e dhcp.option.vendor_class_id -e dhcp.option.request_list_item
+
+    echo; echo '### TLS ClientHello identity (SNI, JA3, JA4)'
+    printf '%s\n' "$fp_tls_rows" | md_table "$tls_hdr"
+    echo
+    echo '_SNI names the service the device phones home to; JA3/JA4 hash the ClientHello itself, which is a per-TLS-stack signature that survives an otherwise encrypted payload._'
+    report_command 1 'table_unique' -Y "$(bssid_filter) && tls.handshake.type==1" \
+      -T fields -E separator=/t -E occurrence=f -E header=y -e ip.src \
+      -e tls.handshake.extensions_server_name "${ja_f[@]}"
+
+    echo; echo '### DNS-SD / mDNS advertised services and model strings'
+    printf '%s\n' "$fp_sd_rows" | md_table $'Source IP\tService (PTR)\tTXT record'
+    echo
+    echo '_DNS-SD advertises what a device **is**: `_airplay._tcp`, `_googlecast._tcp`, `_printer._tcp`, and TXT records that frequently carry an explicit `model=` string._'
+    report_command 1 'table_unique' -Y "$(bssid_filter) && (dns.ptr.domain_name || dns.txt)" \
+      -T fields -E separator=/t -E header=y -E aggregator=, -e ip.src -e dns.ptr.domain_name -e dns.txt
+
+    echo; echo '### OS hint from observed IP TTL'
+    printf '%s\n' "$fp_ttl_rows" | md_table $'Source IP\tMax TTL seen\tLikely initial TTL\tLikely stack\tPackets'
+    echo
+    echo '> [!note] TTL is a hint, not proof. Stacks ship distinct initial values (64 for Linux/Android/macOS/iOS/BSD, 128 for Windows, 255 for network gear and printers), but any router in the path decrements it, so a lower observed value does not by itself change the verdict.'
+    report_command 1 'table_rows  # then WiFiScope takes the max TTL per source' \
+      -Y "$(bssid_filter) && ip" -T fields -E separator=/t -E header=y -e ip.src -e ip.ttl
+
+    echo; echo '## 10. Decrypted DNS and software evidence'
     echo; echo '### DNS/mDNS/LLMNR names and answers'
     printf '%s\n' "$dns_rows" | md_table $'Frame\tSource IP\tDestination IP\tQuery\tResponse name\tA\tAAAA\tCopies'
     report_command 1 "sort -u | head -n $row_limit | table_rows" -Y "$(bssid_filter) && (dns.qry.name || dns.resp.name)" \
@@ -2157,7 +3078,7 @@ KEYS_TMPL
       echo '_No matching evidence observed (decryption produced no L3 traffic for this target)._'
     fi
 
-    echo; echo '## 10. Capture-quality checks'
+    echo; echo '## 11. Capture-quality checks'
     printf '| Check | Count | Interpretation |\n| --- | ---: | --- |\n'
     printf '| Truncated frames | %s | cap_len < frame.len |\n' "$truncated_count"
     printf '| Target retry frames | %s | Retries may reflect RF loss/contention; not unique traffic |\n' "$retry_count"
@@ -2165,7 +3086,7 @@ KEYS_TMPL
     report_command 0 'wc -l' -Y 'frame.cap_len < frame.len'
     report_command 0 'wc -l' -Y "$(bssid_filter) && wlan.fc.retry==1"
 
-    echo; echo '## 11. Limitations, gaps, and questions'
+    echo; echo '## 12. Limitations, gaps, and questions'
     echo
     [ "$decrypt_count" -gt 0 ] || echo '- **Gap:** Decryption was not validated. Do not treat absent DHCP, ARP, DNS, hostname, endpoint, or banner rows as evidence of absence.'
     [ -n "$gateway" ] || echo '- **Gap:** No DHCP default-router option was observed after decryption; no AP may be labeled a confirmed gateway.'
@@ -2231,6 +3152,45 @@ selftest() {
   check_akm "" "1" "" "WEP"
   check_akm "" "" "yes" "WPA1"
   check_akm "" "" "" "open"
+  # WPA3 R3 group-dependent-hash SAE — a real AKM that used to fall through to
+  # "open (no encryption)", the most dangerous possible mislabel.
+  check_akm "24" "" "" "WPA3-Personal (SAE)"
+  check_akm "25" "" "" "WPA3-Personal (SAE)"
+  check_akm "2 24" "" "" "transition"
+
+  # ---- RSN selector decoding -------------------------------------------------
+  check_str() { # <label> <got> <want>
+    if [ "$2" = "$3" ]; then ok "$1"; else
+      note "FAIL $1: got '$2', want '$3'"
+      fail=1
+    fi
+  }
+  check_str "akm_names decodes SAE/PSK/OWE/Suite-B and labels unknowns" \
+    "$(printf '8\n2\n18\n12\n24\n99\n' | akm_names | paste -sd, -)" \
+    "SAE,PSK,OWE,802.1X-SuiteB-192-SHA384,SAE-GDH,AKM-99"
+  check_str "cipher_names decodes CCMP/GCMP/TKIP and labels unknowns" \
+    "$(printf '4\n8\n9\n10\n2\n99\n' | cipher_names | paste -sd, -)" \
+    "CCMP-128,GCMP-128,GCMP-256,CCMP-256,TKIP,cipher-99"
+  check_str "rsn_decode_row rewrites ciphers/AKMs in place and maps PMF to yes/no" \
+    "$(printf 'aa:bb:cc:00:11:22\t1\t9\t9\t8,2\t1\t0\n' | rsn_decode_row | tr '\t' '|')" \
+    "aa:bb:cc:00:11:22|1|GCMP-256|GCMP-256|SAE,PSK|yes|no"
+  check_str "rsn_decode_row reads tshark's True/False booleans, not just 1/0" \
+    "$(printf 'aa:bb:cc:00:11:22\tTrue\t4\t4\t8\tTrue\tFalse\n' | rsn_decode_row | tr '\t' '|')" \
+    "aa:bb:cc:00:11:22|True|CCMP-128|CCMP-128|SAE|yes|no"
+  check_str "rsn_decode_row leaves blank RSN columns blank (open network)" \
+    "$(printf 'aa:bb:cc:00:11:22\t\t\t\t\t\t\n' | rsn_decode_row | tr '\t' '|')" \
+    "aa:bb:cc:00:11:22||||||"
+
+  # wifi_generation: capability elements -> marketing generation, plus randomized-MAC
+  # detection. Pure logic, so assert it directly.
+  check_str "wifi_generation reads HE/VHT/HT and flags randomized MACs" \
+    "$(printf '00:11:22:00:00:01\tAcme_x\t0x1\t0x2\t\t5180\n7a:3d:76:c3:25:3f\t\t0x1\t\t\t2437\nfc:31:5d:5b:98:5e\tApple_y\t0x1\t0x2\t0x3\t5955\naa:bb:cc:00:00:09\t\t\t\t\t2437\n' |
+        wifi_generation | awk -F'\t' '{print $1,$2,$3,$4}' | paste -sd';' -)" \
+    "00:11:22:00:00:01 Acme_x hardware Wi-Fi 5 (11ac);7a:3d:76:c3:25:3f — randomized Wi-Fi 4 (11n);fc:31:5d:5b:98:5e Apple_y hardware Wi-Fi 6E (11ax, 6 GHz);aa:bb:cc:00:00:09 — randomized legacy 11a/b/g"
+  check_str "ttl_os_hint maps observed TTL to a likely stack" \
+    "$(printf '10.0.0.5\t64\n10.0.0.5\t64\n10.0.0.9\t128\n10.0.0.1\t255\n' |
+        ttl_os_hint | awk -F'\t' '{print $1"="$3}' | paste -sd, -)" \
+    "10.0.0.5=64,10.0.0.9=128,10.0.0.1=255"
 
   got="$(printf 'de:ad:be:ef:00:01\nff:ff:ff:ff:ff:ff\n01:00:5e:00:00:fb\n33:33:00:00:00:01\naa:bb:cc:dd:ee:00\n' |
     drop_group | tr '\n' ',')"
@@ -2307,11 +3267,11 @@ menu() {
     kn="$([ -s "${KEYRING:-/dev/null}" ] && grep -c . "$KEYRING" || echo 0)"
     cat <<EOF
 
-  ${C_B}wifiscope${C_RESET}  pcap:${C_CYN}${PCAP##*/}${C_RESET}  target:${C_B}${SSID:-<none>}${C_RESET}  decrypt:$([ ${#DEC[@]} -gt 0 ] && printf "%son%s" "$C_GRN" "$C_RESET" || printf "%soff%s" "$C_DIM" "$C_RESET")  keys:${C_MAG}${kn}${C_RESET}
+  ${C_B}wifiscope${C_RESET}  pcap:${C_CYN}${PCAP##*/}${C_RESET}  target:${C_B}${SSID:-<none>}${C_RESET} ${C_DIM}(${#TGT_BSSIDS[@]} bssid)${C_RESET}  decrypt:$([ ${#DEC[@]} -gt 0 ] && printf "%son%s" "$C_GRN" "$C_RESET" || printf "%soff%s" "$C_DIM" "$C_RESET")  keys:${C_MAG}${kn}${C_RESET}
   ${C_DIM}──────────────────────────────────────────────────────────${C_RESET}
    ${C_CYN}ANALYZE${C_RESET}  1 recon   2 bands   3 crypto   4 hardware
             5 clients 6 keys    7 topology 8 hosts
-            9 probes  0 handshakes
+            9 probes  0 handshakes  f fingerprint
    ${C_CYN}CRACK${C_RESET}    p pmkid   x export22000  ${C_DIM}(hashcat -m 22000)${C_RESET}
    ${C_CYN}KEYS${C_RESET}     k passphrase  h harvest  g scrapegtk  j keymaterial
             a addkey  i import  K show  d delkey  c clearkey
@@ -2326,12 +3286,13 @@ EOF
       2|bands)      bands | paint ;;
       3|crypto)     crypto | paint ;;
       4|hardware)   hardware | paint ;;
-      5|clients)    clients | paint ;;
-      6|keys)       keys | paint ;;
+      5|clients)    need_all_bssids; clients | paint ;;
+      6|keys)       need_all_bssids; keys | paint ;;
       7|topology)   topology | paint ;;
       8|hosts)      hosts | paint ;;
       9|probes)     probes | paint ;;
-      0|handshakes) handshakes | paint ;;
+      0|handshakes) need_all_bssids; handshakes | paint ;;
+      f|fingerprint) fingerprint | paint ;;
       p|pmkid)      pmkid | paint ;;
       x|export*)    printf 'output file [%s]: ' "${PCAP%.*}.hc22000"; read -e -r f; export22000 "${f:-}" ;;
       h|harvest)    harvest ;;
@@ -2344,9 +3305,9 @@ EOF
       K|keyring)    keyring ;;
       d|delkey)     delkey ;;
       c|clearkey)   clearkey ;;
-      m|map)        printf 'drawio file [%s.drawio]: ' "${SSID:-net}"; read -e -r f; map "${f:-}" ;;
-      M|mapall)     printf 'drawio file [network.drawio]: '; read -e -r f; mapall "${f:-}" ;;
-      r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; report "${f:-}" ;;
+      m|map)        printf 'drawio file [%s.drawio]: ' "${SSID:-net}"; read -e -r f; need_all_bssids; map "${f:-}" ;;
+      M|mapall)     printf 'drawio file [network.drawio]: '; read -e -r f; need_all_bssids; mapall "${f:-}" ;;
+      r)            printf 'report file [wifiscope_%s.md]: ' "${SSID:-report}"; read -e -r f; need_all_bssids; report "${f:-}" ;;
       q|quit)       break ;;
       *)            note "unknown choice: $c" ;;
     esac
@@ -2359,8 +3320,9 @@ main() {
   case "${1:-}" in
     -V|--version|version) printf 'wifiscope %s\n' "$VERSION"; return ;;
     -h|--help|help)       banner; printf 'usage: wifiscope.sh [command] [pcap] [ssid] [passphrase]\n'
+                          printf '       wifiscope.sh <pcap> [ssid] [passphrase]   # menu, no startup prompts\n'
                           printf 'commands: recon bands crypto hardware clients keys topology hosts\n'
-                          printf '          probes handshakes pmkid export22000 map mapall report\n'
+                          printf '          probes handshakes fingerprint pmkid export22000 map mapall report\n'
                           printf '          harvest scrapegtk keymaterial keyring addkey import delkey clearkey\n'
                           printf '          selftest version   (run with no args for the interactive menu)\n'; return ;;
     selftest)             selftest; return ;;
@@ -2402,14 +3364,17 @@ main() {
 
   # One-shot form:  wifiscope.sh <command> <pcap> [ssid] [passphrase]
   case "${1:-}" in
-    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keymaterial|keyring|pmkid|probes|handshakes|export22000|map|mapall)
+    recon|bands|crypto|hardware|clients|keys|topology|hosts|report|harvest|scrapegtk|keymaterial|keyring|pmkid|probes|handshakes|fingerprint|export22000|map|mapall)
       local cmd="$1"; shift
       [ -n "${1:-}" ] || die "usage: wifiscope.sh $cmd <pcap> [ssid] [passphrase]"
       load_pcap "$1"
       # mapall has no SSID/passphrase operands: arg 2 is an optional output path.
-      if [ "$cmd" = mapall ]; then SSID=""; mapall "${2:-}"; return; fi
+      if [ "$cmd" = mapall ]; then SSID=""; need_all_bssids; mapall "${2:-}"; return; fi
       SSID="${2:-}"
       [ -n "$SSID" ] && load_target_bssids
+      # Only these need the whole-capture BSSID index; load it in the PARENT shell so
+      # both `cmd` and `paint` (each a subshell of the pipe below) can see it.
+      case "$cmd" in clients|keys|handshakes|map|report) need_all_bssids ;; esac
       if [ -n "${3:-}" ] && [ -n "$SSID" ]; then
         PASS="$3"; kr_add wpa-pwd "$PASS:$SSID"; rebuild_dec
       fi
@@ -2417,7 +3382,7 @@ main() {
       [ -z "$SSID" ] && [ "$cmd" != recon ] && [ "$cmd" != mapall ] && note "no SSID given — pass one as arg 2 for scoped results"
       # Paint the read-only display commands; run the rest (report/harvest/…) direct.
       # mapall takes no SSID, so its arg-2 (if any) is the output .drawio filename.
-      case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes keymaterial " in
+      case " recon bands crypto hardware clients keys topology hosts pmkid probes handshakes fingerprint keymaterial " in
         *" $cmd "*) "$cmd" | paint ;;
         *) "$cmd" ;;
       esac
@@ -2425,7 +3390,7 @@ main() {
       ;;
   esac
 
-  # Interactive form: optional pcap as $1, else ask.
+  # Interactive form:  wifiscope.sh [pcap] [ssid] [passphrase]
   if [ -n "${1:-}" ]; then
     load_pcap "$1"
   else
@@ -2434,8 +3399,42 @@ main() {
     read -e -r p
     load_pcap "$p"
   fi
-  pick_ssid
-  set_key
+
+  # ---- FAST PATH:  wifiscope.sh <pcap> <SSID> [passphrase] ------------------
+  # Naming the target up front makes both startup prompts redundant, so skip them.
+  # What this saves: pick_ssid renders a picker you have already answered, and to do
+  # that it reads the WHOLE capture twice (once for beacon SSIDs, once for hidden-AP
+  # BSSIDs) plus one more full pass per hidden AP inside resolve_hidden. Naming the
+  # SSID replaces all of that with one early-exit probe that stops at the first
+  # matching beacon. Startup drops from 4+ full passes and 2 prompts to 1 partial
+  # pass and 1 full pass (load_target_bssids, kept full so mesh/multi-AP targets
+  # still resolve EVERY BSSID — scoping to one AP would quietly narrow every
+  # downstream command).
+  # Note these args used to be accepted and then silently ignored on this path.
+  if [ -n "${2:-}" ]; then
+    SSID="$2"
+    if ssid_exists "$SSID"; then
+      load_target_bssids
+      note "target SSID: $SSID  (${#TGT_BSSIDS[@]} BSSIDs)"
+    else
+      note "SSID \"$SSID\" is not in this capture — falling back to the picker"
+      SSID=""
+      pick_ssid
+    fi
+    # Passphrase as arg 3 replaces the set_key prompt. Blank/absent = leave
+    # decryption off; the menu's `k` still adds one later.
+    if [ -n "${3:-}" ] && [ -n "$SSID" ]; then
+      PASS="$3"
+      if kr_add wpa-pwd "$PASS:$SSID"; then
+        rebuild_dec
+        note "decryption enabled (wpa-pwd added to keyring)"
+        sae_passphrase_warning
+      fi
+    fi
+  else
+    pick_ssid
+    set_key
+  fi
   menu
 }
 
